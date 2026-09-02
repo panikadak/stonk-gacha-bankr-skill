@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Stonk Gacha</title>
+  <desc id="desc">A green capsule with an upward stock line</desc>
+  <defs>
+    <linearGradient id="bg" x1="24" y1="16" x2="232" y2="240" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#10251c"/>
+      <stop offset="1" stop-color="#07110d"/>
+    </linearGradient>
+    <linearGradient id="cap" x1="70" y1="56" x2="184" y2="199" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#b8ff7a"/>
+      <stop offset="1" stop-color="#52d273"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <g transform="rotate(-34 128 128)">
+    <rect x="65" y="42" width="126" height="172" rx="63" fill="#f4f7ea"/>
+    <path d="M65 128h126v23a63 63 0 0 1-63 63 63 63 0 0 1-63-63z" fill="url(#cap)"/>
+    <path d="M65 128h126" stroke="#10251c" stroke-width="10"/>
+    <path d="M92 102l23-19 19 14 31-35" fill="none" stroke="#10251c" stroke-linecap="round" stroke-linejoin="round" stroke-width="11"/>
+    <path d="M146 62h19v19" fill="none" stroke="#10251c" stroke-linecap="round" stroke-linejoin="round" stroke-width="11"/>
+  </g>
+</svg>

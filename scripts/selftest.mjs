@@ -1,0 +1,894 @@
+#!/usr/bin/env node
+// Zero-dependency offline regression suite. Add --live for read-only Base
+// deployment, offer, request, accounting, and Bankr execution-fixture proofs.
+
+import { randomBytes } from "node:crypto";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import {
+  decodeAddress,
+  decodeBool,
+  decodeBytes32,
+  decodeCallArguments,
+  decodeParameters,
+  encodeAddress,
+  encodeCall,
+  encodeParameters,
+  encodeUint,
+  formatUnits,
+  normalizeAddress,
+  parseUnits,
+  strip0x,
+  stripErc8021Suffix,
+  toAddress,
+} from "./lib/abi.mjs";
+import {
+  BEFORE_EXECUTION_EVENT_TOPIC,
+  ECRECOVER_PRECOMPILE,
+  ENTRY_POINT_V07,
+  ENTRY_POINT_V07_CODE_HASH,
+  HANDLE_OPS_SELECTOR,
+  KERNEL_DELEGATION_DESIGNATOR,
+  KERNEL_EXECUTE_SELECTOR,
+  KERNEL_IMPLEMENTATION,
+  KERNEL_IMPLEMENTATION_CODE_HASH,
+  KERNEL_VALIDATION_STORAGE_SLOT,
+  ROOT_VALIDATOR_SELECTOR,
+  USER_OPERATION_EVENT_TOPIC,
+  authorizationRecoveryCall,
+  decodeAuthorizationAuthority,
+  decodeBankrExecution,
+  decodeRootValidator,
+  proveKernelDelegationAtTransaction,
+  sumCanonicalErc20Transfers,
+  userOperationHashCall,
+  verifyBankrExecutionReceipt,
+} from "./lib/bankr.mjs";
+import {
+  beginSnapshot,
+  confirmSnapshot,
+  ethCall,
+  getBlockByHash,
+  getCode,
+  getCodeHash,
+  getReceipt,
+  getStorageAt,
+  getTransaction,
+  getTransactionCount,
+} from "./lib/chain.mjs";
+import { eventTopic, keccak256, selector } from "./lib/keccak256.mjs";
+import {
+  ADDR,
+  ALLOWED_ACTIONS,
+  BANKR_EXECUTION,
+  BPS,
+  DEPLOYMENT,
+  SIGNING_POLICY,
+  SIG,
+  confirmationKey,
+  decodeTokenDecimals,
+  knownActionBySelector,
+  localOfferHash,
+  profitStatus,
+  protocolStatus,
+  readOffer,
+  readRequest,
+  readUint,
+  requiresAllowanceReset,
+  verifyDeployment,
+  walletRequests,
+} from "./lib/protocol.mjs";
+
+const LIVE = process.argv.includes("--live");
+const results = [];
+
+function check(name, pass, detail = "") {
+  results.push({ status: pass ? "pass" : "fail", name, detail: pass ? "" : String(detail || "assertion was false") });
+}
+
+function equal(name, actual, expected) {
+  const pass = actual === expected;
+  check(name, pass, pass ? "" : `actual=${String(actual)} expected=${String(expected)}`);
+}
+
+function deepEqual(name, actual, expected) {
+  const actualJson = JSON.stringify(actual, (_, value) => typeof value === "bigint" ? `${value}n` : value);
+  const expectedJson = JSON.stringify(expected, (_, value) => typeof value === "bigint" ? `${value}n` : value);
+  equal(name, actualJson, expectedJson);
+}
+
+function rejects(name, fn, expectedMessage) {
+  try {
+    fn();
+    check(name, false, "did not reject");
+  } catch (error) {
+    check(name, String(error.message).includes(expectedMessage), error.message);
+  }
+}
+
+async function rejectsAsync(name, fn, expectedMessage) {
+  try {
+    await fn();
+    check(name, false, "did not reject");
+  } catch (error) {
+    check(name, String(error.message).includes(expectedMessage), error.message);
+  }
+}
+
+function skip(name, detail) {
+  results.push({ status: "skip", name, detail });
+}
+
+function encodeDynamicBytes(value) {
+  const body = strip0x(value);
+  if (!/^[0-9a-fA-F]*$/.test(body) || body.length % 2 !== 0) throw new Error("test bytes must be even-length hex");
+  return encodeUint(body.length / 2) + body.toLowerCase().padEnd(Math.ceil(body.length / 64) * 64, "0");
+}
+
+function kernelExecute(target, value, data, mode = 0n) {
+  const packed = `${strip0x(target)}${encodeUint(value)}${strip0x(data)}`;
+  return `${KERNEL_EXECUTE_SELECTOR}${encodeUint(mode)}${encodeUint(64n)}${encodeDynamicBytes(`0x${packed}`)}`;
+}
+
+function userOperationTuple(sender, nonce, callData, { initCode = "0x", paymaster = "0x", signature = "0x5678" } = {}) {
+  const headWords = 9;
+  const encodedInitCode = encodeDynamicBytes(initCode);
+  const encodedCallData = encodeDynamicBytes(callData);
+  const encodedPaymaster = encodeDynamicBytes(paymaster);
+  const encodedSignature = encodeDynamicBytes(signature);
+  const initCodeOffset = headWords * 32;
+  const callDataOffset = initCodeOffset + encodedInitCode.length / 2;
+  const paymasterOffset = callDataOffset + encodedCallData.length / 2;
+  const signatureOffset = paymasterOffset + encodedPaymaster.length / 2;
+  return `${encodeAddress(sender)}${encodeUint(nonce)}${encodeUint(initCodeOffset)}${encodeUint(callDataOffset)}`
+    + `${encodeUint(0n)}${encodeUint(100_000n)}${encodeUint(0n)}${encodeUint(paymasterOffset)}${encodeUint(signatureOffset)}`
+    + `${encodedInitCode}${encodedCallData}${encodedPaymaster}${encodedSignature}`;
+}
+
+function handleOpsMany(tuples) {
+  if (!Array.isArray(tuples) || tuples.length < 1) throw new Error("test handleOps requires tuples");
+  const beneficiary = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  let offset = tuples.length * 32;
+  let offsets = "";
+  for (const tuple of tuples) {
+    offsets += encodeUint(offset);
+    offset += tuple.length / 2;
+  }
+  return `${HANDLE_OPS_SELECTOR}${encodeUint(64n)}${encodeAddress(beneficiary)}${encodeUint(tuples.length)}${offsets}${tuples.join("")}`;
+}
+
+function handleOps(sender, nonce, callData, options = {}) {
+  return handleOpsMany([userOperationTuple(sender, nonce, callData, options)]);
+}
+
+function beforeExecutionEvent(entryPoint) {
+  return { address: entryPoint, topics: [BEFORE_EXECUTION_EVENT_TOPIC], data: "0x" };
+}
+
+function userOperationEvent(entryPoint, sender, nonce, userOpHash, success = true) {
+  return {
+    address: entryPoint,
+    topics: [
+      USER_OPERATION_EVENT_TOPIC,
+      userOpHash,
+      `0x${encodeAddress(sender)}`,
+      `0x${encodeAddress("0xcccccccccccccccccccccccccccccccccccccccc")}`,
+    ],
+    data: `0x${encodeUint(nonce)}${encodeUint(success ? 1n : 0n)}${encodeUint(123n)}${encodeUint(456n)}`,
+  };
+}
+
+function syntheticAuthorization(target, nonce = 0n) {
+  return {
+    chainId: "0x2105",
+    address: target,
+    nonce: `0x${nonce.toString(16)}`,
+    yParity: "0x0",
+    r: "0x1",
+    s: "0x1",
+  };
+}
+
+const wallet = "0x1111111111111111111111111111111111111111";
+const otherWallet = "0x2222222222222222222222222222222222222222";
+const relayer = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+function syntheticTransaction(index, { type = "0x2", from = relayer, to = null, input = "0x", authorizations } = {}) {
+  return {
+    hash: keccak256(`delegation-test-${index}-${type}-${authorizations?.length ?? 0}`),
+    transactionIndex: `0x${index.toString(16)}`,
+    type,
+    from,
+    to,
+    input,
+    ...(authorizations ? { authorizationList: authorizations } : {}),
+  };
+}
+
+// Ethereum hashing primitives and reviewed selectors.
+equal("keccak empty vector", keccak256(""), "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
+equal("keccak abc vector", keccak256("abc"), "0x4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45");
+equal("ERC20 approve selector", selector("approve(address,uint256)"), "0x095ea7b3");
+equal("open pack selector", selector("openPack(uint256,uint256,bytes32,bytes32)"), "0x19b4242f");
+equal("claim prize selector", selector("claimPrize(uint256,uint256,uint256)"), "0xf6c94230");
+equal("profit distribution selector", selector("distributeProfit(uint256,uint256,uint256)"), "0x077317e3");
+equal("ERC20 Transfer topic", eventTopic("Transfer(address,address,uint256)"), "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
+
+// Canonical ABI round trips, fixed and dynamic shapes used by the protocol.
+const sampleHash = keccak256("ordered-offer");
+const userRandom = `0x${"42".repeat(32)}`;
+const openPack = encodeCall(
+  "openPack(uint256,uint256,bytes32,bytes32)",
+  ["uint256", "uint256", "bytes32", "bytes32"],
+  [1n, 100_000n, sampleHash, userRandom],
+);
+equal("open calldata selector", openPack.slice(0, 10), "0x19b4242f");
+equal("open calldata byte length", (openPack.length - 2) / 2, 4 + 4 * 32);
+deepEqual(
+  "open calldata canonical round trip",
+  decodeCallArguments(["uint256", "uint256", "bytes32", "bytes32"], openPack),
+  [1n, 100_000n, sampleHash, userRandom],
+);
+
+const tokenSet = [wallet, otherWallet, ADDR.weth];
+const routeSet = [keccak256("route-0"), keccak256("route-1"), keccak256("route-2")];
+const dynamicOffer = encodeParameters(["uint256", "address[]", "bytes32[]"], [100_000n, tokenSet, routeSet]);
+const decodedOffer = decodeParameters(["uint256", "address[]", "bytes32[]"], `0x${dynamicOffer}`);
+equal("dynamic offer ceiling", decodedOffer[0], 100_000n);
+deepEqual("dynamic address array", decodedOffer[1], tokenSet.map((entry) => entry.toLowerCase()));
+deepEqual("dynamic bytes32 array", decodedOffer[2], routeSet);
+
+const fixedOdds = encodeParameters(["uint32[4]", "bool", "uint8"], [[20_000n, 50_000n, 100_000n, 1_000_000n], true, 2n]);
+const decodedFixedOdds = decodeParameters(["uint32[4]", "bool", "uint8"], `0x${fixedOdds}`);
+deepEqual("fixed ceiling array", decodedFixedOdds[0], [20_000n, 50_000n, 100_000n, 1_000_000n]);
+equal("canonical ABI bool true", decodedFixedOdds[1], true);
+equal("canonical uint8", decodedFixedOdds[2], 2n);
+
+const textAndBytes = encodeParameters(["string", "bytes"], ["Stonk Gacha", "0x00ff8021"]);
+deepEqual("dynamic string and bytes", decodeParameters(["string", "bytes"], `0x${textAndBytes}`), ["Stonk Gacha", "0x00ff8021"]);
+equal("address word round trip", toAddress(encodeAddress(wallet)), wallet);
+equal("decode address result", decodeAddress(`0x${encodeAddress(otherWallet)}`), otherWallet);
+equal("decode bool false", decodeBool(`0x${encodeUint(0n)}`), false);
+equal("decode bytes32 result", decodeBytes32(sampleHash), sampleHash);
+equal("canonical token decimals result", decodeTokenDecimals(`0x${encodeUint(18n)}`), 18);
+rejects("empty token decimals falls back", () => decodeTokenDecimals("0x"), "exactly one ABI word");
+rejects("short token decimals falls back", () => decodeTokenDecimals("0x12"), "exactly one ABI word");
+rejects("trailing token decimals word falls back", () => decodeTokenDecimals(`0x${encodeUint(18n)}${encodeUint(0n)}`), "exactly one ABI word");
+rejects("out-of-range token decimals falls back", () => decodeTokenDecimals(`0x${encodeUint(37n)}`), "supported display range");
+equal("parse exact USDC units", parseUnits("20.000001", 6), 20_000_001n);
+equal("format exact USDC units", formatUnits(20_000_001n, 6), "20.000001");
+rejects("reject excess USDC decimals", () => parseUnits("1.0000001", 6), "more than 6 decimal places");
+rejects("reject non-canonical decimal", () => parseUnits("01", 6), "invalid decimal amount");
+rejects("reject invalid address", () => normalizeAddress("0x1234"), "invalid EVM address");
+rejects("reject non-canonical address word", () => toAddress(`01${"0".repeat(22)}${"11".repeat(20)}`), "non-canonical ABI address");
+rejects("reject non-canonical bool", () => decodeCallArguments(["bool"], `0x12345678${encodeUint(2n)}`), "non-canonical ABI bool");
+rejects("reject uint8 overflow word", () => decodeCallArguments(["uint8"], `0x12345678${encodeUint(256n)}`), "non-canonical uint8");
+rejects("reject calldata trailing word", () => decodeCallArguments(["uint256", "uint256", "bytes32", "bytes32"], `${openPack}${encodeUint(0n)}`), "canonical ABI re-encoding");
+rejects("reject unaligned dynamic offset", () => decodeCallArguments(["address[]"], `0x12345678${encodeUint(33n)}${encodeUint(0n)}`), "unsafe offset");
+rejects("reject overlapping dynamic offset", () => decodeCallArguments(["address[]"], `0x12345678${encodeUint(0n)}`), "canonical ABI re-encoding");
+const gappedDynamic = `0x12345678${encodeUint(64n)}${encodeUint(0xdeadn)}${encodeUint(1n)}${encodeAddress(wallet)}`;
+rejects("reject gapped dynamic ABI", () => decodeCallArguments(["address[]"], gappedDynamic), "canonical ABI re-encoding");
+const nonzeroPadding = `0x12345678${encodeUint(32n)}${encodeUint(1n)}ff${"01".repeat(31)}`;
+rejects("reject nonzero dynamic bytes padding", () => decodeCallArguments(["bytes"], nonzeroPadding), "canonical ABI re-encoding");
+rejects("reject odd-length dynamic bytes input", () => encodeParameters(["bytes"], ["0x0"]), "even-length");
+rejects("reject non-hex dynamic bytes input", () => encodeParameters(["bytes"], ["0xzz"]), "hex");
+
+// Offer commitments are ordered. Reordering either dimension must change the
+// local commitment; this is the core defense against post-payment re-derivation.
+const commitment = localOfferHash(1, 100_000n, tokenSet, routeSet);
+equal("offer commitment deterministic", localOfferHash(1, 100_000n, tokenSet, routeSet), commitment);
+check("offer token order changes commitment", localOfferHash(1, 100_000n, [...tokenSet].reverse(), routeSet) !== commitment);
+check("offer route order changes commitment", localOfferHash(1, 100_000n, tokenSet, [...routeSet].reverse()) !== commitment);
+check("offer pack index changes commitment", localOfferHash(0, 100_000n, tokenSet, routeSet) !== commitment);
+check("offer ceiling changes commitment", localOfferHash(1, 50_000n, tokenSet, routeSet) !== commitment);
+
+// ERC-8021 suffixes accepted by the Bankr execution decoder.
+const schema0 = `${openPack}62635f73746f6e6b67090080218021802180218021802180218021`;
+const stripped0 = stripErc8021Suffix(schema0);
+equal("ERC-8021 schema 0 strips to call", stripped0.calldata, openPack);
+deepEqual("ERC-8021 schema 0 builder codes", stripped0.attribution.codes, ["bc_stonkg"]);
+const schema1 = `${openPack}${"cc".repeat(20)}210502626173656170702c6d6f7270686f0e0180218021802180218021802180218021`;
+const stripped1 = stripErc8021Suffix(schema1);
+equal("ERC-8021 schema 1 strips to call", stripped1.calldata, openPack);
+equal("ERC-8021 schema 1 registry", stripped1.attribution.codeRegistry.address, `0x${"cc".repeat(20)}`);
+equal("ERC-8021 schema 1 chain", stripped1.attribution.codeRegistry.chainId, 8453);
+deepEqual("ERC-8021 schema 1 codes", stripped1.attribution.codes, ["baseapp", "morpho"]);
+const schema2 = `${openPack}a161616762617365617070000b0280218021802180218021802180218021`;
+const stripped2 = stripErc8021Suffix(schema2);
+equal("ERC-8021 schema 2 strips to call", stripped2.calldata, openPack);
+equal("ERC-8021 schema 2 opaque", stripped2.attribution.opaque, true);
+equal("ERC-8021 schema 2 byte length", stripped2.attribution.cborBytes, 11);
+rejects("reject empty ERC-8021 builder entry", () => stripErc8021Suffix(`${openPack}612c2c62040080218021802180218021802180218021`), "invalid ERC-8021 builder codes");
+rejects("reject unsupported ERC-8021 schema", () => stripErc8021Suffix(`${openPack}ff80218021802180218021802180218021`), "unsupported ERC-8021 schema");
+
+// The signing policy itself is executable data: selectors are recomputed and
+// the lookup remains target-and-selector scoped with a default deny.
+equal("signing policy chain", SIGNING_POLICY.chainId, 8453);
+check("signing policy default deny", SIGNING_POLICY.defaultDeny === true);
+equal("one transaction per plan", SIGNING_POLICY.maxTransactionsPerPlan, 1);
+equal("allowlisted action count", ALLOWED_ACTIONS.length, 9);
+for (const action of ALLOWED_ACTIONS) {
+  equal(`policy selector ${action.name}`, action.selector, selector(action.signature));
+  equal(`policy lookup ${action.name}`, knownActionBySelector(action.target, action.selector)?.name, action.name);
+  check(`policy context ${action.name}`, Array.isArray(action.contextActions) && action.contextActions.length > 0);
+  check(`policy value rule ${action.name}`, action.valueRule === "zero" || action.valueRule === "exact-live-entropy-fee");
+}
+equal("wrong target defaults to deny", knownActionBySelector(otherWallet, selector("openPack(uint256,uint256,bytes32,bytes32)")), null);
+equal("wrong selector defaults to deny", knownActionBySelector(ADDR.gacha, selector("transfer(address,uint256)")), null);
+equal("Treasury direct write defaults to deny", knownActionBySelector(ADDR.treasury, selector("executePayout(bytes32,address,uint256,address,uint256)")), null);
+equal("owner pause defaults to deny", knownActionBySelector(ADDR.gacha, selector("setSalesPaused(bool)")), null);
+const openPolicy = ALLOWED_ACTIONS.find((entry) => entry.name === "open-pack");
+equal("open is exact live fee only", openPolicy.valueRule, "exact-live-entropy-fee");
+const approvePolicy = ALLOWED_ACTIONS.find((entry) => entry.name === "approve");
+deepEqual("approval contexts are bounded", approvePolicy.contextActions, ["open-pack", "fund-reserve", "revoke-usdc"]);
+check("approval rules require exact/reset", approvePolicy.rules.includes("amount-is-zero-reset-or-exact-fresh-plan"));
+for (const denied of SIGNING_POLICY.explicitlyDenied.filter((entry) => entry.selector)) {
+  equal(`denied selector pin ${denied.signature}`, denied.selector, selector(denied.signature));
+  equal(`denied call remains absent ${denied.signature}`, knownActionBySelector(ADDR.gacha, denied.selector), null);
+}
+const userWrites = new Set(ALLOWED_ACTIONS.map((entry) => entry.signature));
+for (const forbidden of [
+  "setSalesPaused(bool)", "wireTreasury(address)", "recoverExcess(uint8,address,uint256,address)",
+  "_entropyCallback(uint64,address,bytes32)", "executePayout(bytes32,address,uint256,address,uint256)",
+]) {
+  check(`privileged/authenticated call excluded: ${forbidden}`, !userWrites.has(forbidden));
+}
+
+// Confirmation is signer-specific even when the economic terms and action are
+// identical. Address casing is normalized before hashing.
+const confirmationTerms = { amountUsdc: 5_000_000n, recipient: wallet };
+const normalizedConfirmation = confirmationKey(ADDR.gacha, "open-pack", confirmationTerms);
+equal(
+  "confirmation key normalizes wallet casing",
+  confirmationKey(DEPLOYMENT.contracts.stonkGacha.address, "open-pack", confirmationTerms),
+  normalizedConfirmation,
+);
+check("confirmation key changes with wallet", confirmationKey(otherWallet, "open-pack", confirmationTerms) !== normalizedConfirmation);
+check("confirmation key changes with action", confirmationKey(ADDR.gacha, "fund-reserve", confirmationTerms) !== normalizedConfirmation);
+check("confirmation key changes with terms", confirmationKey(ADDR.gacha, "open-pack", { ...confirmationTerms, amountUsdc: 10_000_000n }) !== normalizedConfirmation);
+
+check("positive mismatched allowance requires reset", requiresAllowanceReset(7n, 5n));
+check("exact desired allowance rejects reset", !requiresAllowanceReset(5n, 5n));
+check("zero allowance rejects reset", !requiresAllowanceReset(0n, 5n));
+rejects("reset predicate rejects nonpositive desired allowance", () => requiresAllowanceReset(5n, 0n), "positive desired amount");
+
+// The CLI's randomness boundary is intentionally tested as source evidence,
+// because the command is a process entrypoint rather than an importable module.
+const plannerSource = readFileSync(new URL("./stonk-gacha.mjs", import.meta.url), "utf8");
+check("planner uses Node CSPRNG", plannerSource.includes("randomBytes(32)"));
+check("planner rejects supplied zero randomness", plannerSource.includes("--user-random cannot be zero"));
+check("calldata inspector rejects zero randomness", plannerSource.includes("user randomness cannot be zero"));
+check("generated randomness loops until nonzero", /do value = .*randomBytes\(32\).*while \(\/\^0x0\{64\}\$\//s.test(plannerSource));
+equal("every plan confirmation call binds wallet", plannerSource.match(/confirmationKey\(wallet, action, terms\)/g)?.length, 2);
+check("open/fund zero reset rejects exact desired allowance", plannerSource.includes("requiresAllowanceReset(current, terms.approval.exactAmount)"));
+check("revocation inspection binds fresh current allowance", plannerSource.includes("assertContextString(current, terms.approval.currentAmount, \"fresh revocation allowance\")"));
+check("simulation sends pinned block to gas estimate", plannerSource.includes("estimateGas(tx.to, tx.data, wallet, BigInt(tx.value), block)"));
+check("status command propagates nested integrity failure", plannerSource.includes("out({ ok: status.ok, command, status }, status.ok ? 0 : 1)"));
+check("request list command threads deployment snapshot", plannerSource.includes("walletRequests(wallet, cursor, limit, snapshot)"));
+check("single request command threads deployment snapshot", plannerSource.includes("readRequest(requestIdArg(), snapshot)"));
+check("profit status command threads deployment snapshot", plannerSource.includes("profitStatus(wallet, snapshot)"));
+check("receipt proof filters exact transfer counterparties", plannerSource.includes("sumCanonicalErc20Transfers(logs, token, \"from\", from, to)") && plannerSource.includes("sumCanonicalErc20Transfers(logs, token, \"to\", to, from)"));
+for (const label of ["pack charge", "prize purchase budget", "refund", "reserve funding", "profit Treasury pull", "profit worker bounty", "profit staker funding"]) {
+  check(`receipt transfer proof is wired: ${label}`, plannerSource.includes(`\"${label}\"`));
+}
+check("planner does not overclaim arbitrary prize-token Transfer proof", !plannerSource.includes("recipient token delta equals recorded stockOut"));
+const sampledRandom = `0x${randomBytes(32).toString("hex")}`;
+check("test runtime produces a 32-byte CSPRNG sample", /^0x[0-9a-f]{64}$/.test(sampledRandom));
+check("zero is outside valid buyer-random domain", !/^0x0{64}$/.test(userRandom) && /^0x0{64}$/.test(`0x${"0".repeat(64)}`));
+
+// Synthetic direct and EntryPoint v0.7 / Kernel envelopes.
+const logicalTarget = ADDR.gacha;
+const directEnvelope = decodeBankrExecution({
+  from: wallet,
+  to: logicalTarget,
+  input: openPack,
+  value: "0x2710",
+}, wallet);
+equal("direct execution mode", directEnvelope.mode, "direct-wallet-transaction");
+equal("direct logical sender", directEnvelope.logicalSender, wallet);
+equal("direct logical target", directEnvelope.logicalCall.target, logicalTarget);
+equal("direct logical value", directEnvelope.logicalCall.value, 10_000n);
+equal("direct logical calldata", directEnvelope.logicalCall.data, openPack);
+const directAttributedEnvelope = decodeBankrExecution({
+  from: wallet,
+  to: logicalTarget,
+  input: schema0,
+  value: "0x0",
+}, wallet);
+equal("direct attribution strips to logical calldata", directAttributedEnvelope.logicalCall.data, openPack);
+equal("direct attribution schema", directAttributedEnvelope.attribution.schemaId, 0);
+equal("direct attribution builder code", directAttributedEnvelope.attribution.codes[0], "bc_stonkg");
+rejects("reject direct type-4 side effect", () => decodeBankrExecution({
+  from: wallet, to: logicalTarget, input: openPack, value: "0x0", type: "0x4", authorizationList: [syntheticAuthorization(KERNEL_IMPLEMENTATION)],
+}, wallet), "must not carry EIP-7702 authorizations");
+rejects("reject direct wallet self-call", () => decodeBankrExecution({ from: wallet, to: wallet, input: openPack, value: "0x0" }, wallet), "must not target the active wallet itself");
+rejects("reject direct wrong sender", () => decodeBankrExecution({ from: relayer, to: logicalTarget, input: openPack, value: "0x0" }, wallet), "sender does not match");
+rejects("reject direct contract creation", () => decodeBankrExecution({ from: wallet, to: null, input: openPack, value: "0x0" }, wallet), "cannot be a contract creation");
+
+const v07Nonce = 17n;
+const kernelCall = kernelExecute(logicalTarget, 10_000n, openPack);
+const v07HandleOps = handleOps(wallet, v07Nonce, kernelCall);
+const sponsoredEnvelope = decodeBankrExecution({ from: relayer, to: ENTRY_POINT_V07, input: v07HandleOps, value: "0x0" }, wallet);
+equal("sponsored execution mode", sponsoredEnvelope.mode, "bankr-entrypoint-kernel-single");
+equal("sponsored logical sender", sponsoredEnvelope.logicalSender, wallet);
+equal("sponsored logical target", sponsoredEnvelope.logicalCall.target, logicalTarget);
+equal("sponsored inner native value", sponsoredEnvelope.logicalCall.value, 10_000n);
+equal("sponsored inner calldata", sponsoredEnvelope.logicalCall.data, openPack);
+equal("sponsored native validation mode", sponsoredEnvelope.validation.mode, 0);
+equal("sponsored native validation type", sponsoredEnvelope.validation.type, 0);
+equal("sponsored empty initCode", sponsoredEnvelope.userOperation.initCode, "0x");
+equal("sponsored empty paymaster", sponsoredEnvelope.userOperation.paymasterAndData, "0x");
+equal("userOp hash call selector", userOperationHashCall(sponsoredEnvelope).slice(0, 10), selector("getUserOpHash((address,uint256,bytes,bytes,bytes32,uint256,bytes32,bytes,bytes))"));
+rejects("direct envelope has no userOp hash", () => userOperationHashCall(directEnvelope), "no user-operation hash call");
+
+const attributedKernelCall = `${kernelCall}62635f69383571686767320b0080218021802180218021802180218021`;
+const attributedEnvelope = decodeBankrExecution({
+  from: relayer,
+  to: ENTRY_POINT_V07,
+  input: handleOps(wallet, v07Nonce, attributedKernelCall),
+  value: "0x0",
+}, wallet);
+equal("sponsored attribution builder code", attributedEnvelope.attribution.codes[0], "bc_i85qhgg2");
+equal("sponsored attributed logical calldata", attributedEnvelope.logicalCall.data, openPack);
+
+rejects("reject sponsored outer value", () => decodeBankrExecution({ from: relayer, to: ENTRY_POINT_V07, input: v07HandleOps, value: "0x1" }, wallet), "outer transaction must carry zero native value");
+rejects("reject sponsored unknown active wallet", () => decodeBankrExecution({ from: relayer, to: ENTRY_POINT_V07, input: v07HandleOps, value: "0x0" }, relayer), "exactly one user operation");
+rejects("reject multiple active-wallet userOps", () => decodeBankrExecution({ from: relayer, to: ENTRY_POINT_V07, input: handleOpsMany([
+  userOperationTuple(wallet, v07Nonce, kernelCall), userOperationTuple(wallet, v07Nonce + 1n, kernelCall),
+]), value: "0x0" }, wallet), "exactly one user operation");
+rejects("reject separate-account initCode", () => decodeBankrExecution({ from: relayer, to: ENTRY_POINT_V07, input: handleOps(wallet, v07Nonce, kernelCall, { initCode: "0x1234" }), value: "0x0" }, wallet), "must not deploy a separate account");
+rejects("reject sponsored paymaster", () => decodeBankrExecution({ from: relayer, to: ENTRY_POINT_V07, input: handleOps(wallet, v07Nonce, kernelCall, { paymaster: "0x1234" }), value: "0x0" }, wallet), "must not use a paymaster");
+rejects("reject non-native validation mode", () => decodeBankrExecution({ from: relayer, to: ENTRY_POINT_V07, input: handleOps(wallet, 1n << 248n, kernelCall), value: "0x0" }, wallet), "validation mode/type 0x00/0x00");
+rejects("reject non-native validation type", () => decodeBankrExecution({ from: relayer, to: ENTRY_POINT_V07, input: handleOps(wallet, 1n << 240n, kernelCall), value: "0x0" }, wallet), "validation mode/type 0x00/0x00");
+rejects("reject Kernel non-default execution mode", () => decodeBankrExecution({ from: relayer, to: ENTRY_POINT_V07, input: handleOps(wallet, v07Nonce, kernelExecute(logicalTarget, 0n, openPack, 1n)), value: "0x0" }, wallet), "single-call default mode");
+rejects("reject Kernel wallet self-call", () => decodeBankrExecution({ from: relayer, to: ENTRY_POINT_V07, input: handleOps(wallet, v07Nonce, kernelExecute(wallet, 0n, openPack)), value: "0x0" }, wallet), "must not target the active wallet itself");
+rejects("reject sponsored trailing ABI word", () => decodeBankrExecution({ from: relayer, to: ENTRY_POINT_V07, input: `${v07HandleOps}${encodeUint(0n)}`, value: "0x0" }, wallet), "trailing or overlapping");
+
+const userOpHash = keccak256("synthetic-user-operation");
+const boundary = beforeExecutionEvent(ENTRY_POINT_V07);
+const successEvent = userOperationEvent(ENTRY_POINT_V07, wallet, v07Nonce, userOpHash);
+const receiptProof = verifyBankrExecutionReceipt(sponsoredEnvelope, { logs: [boundary, successEvent] }, userOpHash);
+check("synthetic user operation succeeded", receiptProof.success);
+equal("synthetic receipt sender", receiptProof.sender, wallet);
+equal("synthetic receipt nonce", receiptProof.nonce, v07Nonce);
+equal("synthetic receipt gas used", receiptProof.actualGasUsed, 456n);
+deepEqual("synthetic receipt trusted log window", receiptProof.receiptLogRange, { start: 1, end: 1 });
+rejects("reject missing UserOperationEvent", () => verifyBankrExecutionReceipt(sponsoredEnvelope, { logs: [boundary] }, userOpHash), "exactly one matching");
+rejects("reject duplicate UserOperationEvent", () => verifyBankrExecutionReceipt(sponsoredEnvelope, { logs: [boundary, successEvent, successEvent] }, userOpHash), "exactly one matching");
+rejects("reject wrong userOp hash", () => verifyBankrExecutionReceipt(sponsoredEnvelope, { logs: [boundary, successEvent] }, keccak256("wrong")), "exactly one matching");
+rejects("reject failed logical operation", () => verifyBankrExecutionReceipt(sponsoredEnvelope, {
+  logs: [boundary, userOperationEvent(ENTRY_POINT_V07, wallet, v07Nonce, userOpHash, false)],
+}, userOpHash), "logical call reverted");
+rejects("reject missing execution boundary", () => verifyBankrExecutionReceipt(sponsoredEnvelope, { logs: [successEvent] }, userOpHash), "BeforeExecution boundary");
+rejects("reject noncanonical receipt bool", () => verifyBankrExecutionReceipt(sponsoredEnvelope, {
+  logs: [{ ...boundary }, { ...successEvent, data: `0x${encodeUint(v07Nonce)}${encodeUint(2n)}${encodeUint(123n)}${encodeUint(456n)}` }],
+}, userOpHash), "not a canonical bool");
+
+const otherKernelCall = kernelExecute(logicalTarget, 0n, openPack);
+const bundleEnvelope = decodeBankrExecution({
+  from: relayer,
+  to: ENTRY_POINT_V07,
+  input: handleOpsMany([userOperationTuple(otherWallet, 3n, otherKernelCall), userOperationTuple(wallet, v07Nonce, kernelCall)]),
+  value: "0x0",
+}, wallet);
+equal("bundle selects active wallet index", bundleEnvelope.userOperation.index, 1);
+equal("bundle size decoded", bundleEnvelope.userOperationCount, 2);
+const otherHash = keccak256("other-operation");
+const unrelatedLog = { address: ADDR.gacha, topics: [eventTopic("UnrelatedProof(uint256)")], data: `0x${encodeUint(1n)}` };
+const bundleProof = verifyBankrExecutionReceipt(bundleEnvelope, {
+  logs: [boundary, unrelatedLog, userOperationEvent(ENTRY_POINT_V07, otherWallet, 3n, otherHash), successEvent],
+}, userOpHash);
+deepEqual("bundle scopes only active operation logs", bundleProof.receiptLogRange, { start: 3, end: 3 });
+
+equal("zero rootValidator decodes", decodeRootValidator(`0x${"0".repeat(64)}`), `0x${"0".repeat(42)}`);
+rejects("reject malformed rootValidator", () => decodeRootValidator(`0x${"1".repeat(64)}`), "canonical ABI bytes21");
+equal("zero ecrecover result is null", decodeAuthorizationAuthority(`0x${"0".repeat(64)}`), null);
+equal("canonical ecrecover result", decodeAuthorizationAuthority(`0x${encodeAddress(wallet)}`), wallet);
+const parsedAuthorization = authorizationRecoveryCall(syntheticAuthorization(KERNEL_IMPLEMENTATION));
+equal("authorization target decoded", parsedAuthorization.target, KERNEL_IMPLEMENTATION);
+equal("authorization chain decoded", parsedAuthorization.chainId, 8453n);
+equal("authorization nonce decoded", parsedAuthorization.nonce, 0n);
+check("authorization signature shape canonical", parsedAuthorization.signatureCanonical);
+
+const transferLog = {
+  address: ADDR.usdc,
+  topics: [eventTopic("Transfer(address,address,uint256)"), `0x${encodeAddress(relayer)}`, `0x${encodeAddress(wallet)}`],
+  data: `0x${encodeUint(5_000_000n)}`,
+};
+equal("canonical incoming USDC transfer sum", sumCanonicalErc20Transfers([transferLog], ADDR.usdc, "to", wallet), 5_000_000n);
+equal("canonical outgoing USDC transfer sum", sumCanonicalErc20Transfers([transferLog], ADDR.usdc, "from", relayer), 5_000_000n);
+equal("exact-counterparty transfer sum", sumCanonicalErc20Transfers([transferLog], ADDR.usdc, "from", relayer, wallet), 5_000_000n);
+equal("wrong-counterparty transfer is excluded", sumCanonicalErc20Transfers([transferLog], ADDR.usdc, "from", relayer, otherWallet), 0n);
+const selfTransfer = { ...transferLog, topics: [transferLog.topics[0], `0x${encodeAddress(wallet)}`, `0x${encodeAddress(wallet)}`] };
+equal("self-transfer is not incoming evidence", sumCanonicalErc20Transfers([selfTransfer], ADDR.usdc, "to", wallet), 0n);
+rejects("reject malformed transfer topic", () => sumCanonicalErc20Transfers([{ ...transferLog, topics: [transferLog.topics[0], `0x${"f".repeat(64)}`, transferLog.topics[2]] }], ADDR.usdc, "to", wallet), "canonical indexed address");
+rejects("reject malformed transfer data", () => sumCanonicalErc20Transfers([{ ...transferLog, data: "0x01" }], ADDR.usdc, "to", wallet), "one uint256 word");
+
+const zeroRootValidatorResult = `0x${"0".repeat(64)}`;
+const persistentTarget = syntheticTransaction(0);
+const persistentProof = await proveKernelDelegationAtTransaction({
+  wallet,
+  transaction: persistentTarget,
+  block: { transactions: [persistentTarget] },
+  parentWalletCode: KERNEL_DELEGATION_DESIGNATOR,
+  parentWalletNonce: 7n,
+  parentRootValidator: zeroRootValidatorResult,
+  recoverAuthority: async () => wallet,
+});
+equal("persistent delegation parent state", persistentProof.parentState, "reviewed-kernel");
+equal("persistent delegation target index", persistentProof.targetTransactionIndex, 0);
+
+const firstUseTarget = syntheticTransaction(0, { type: "0x4", authorizations: [syntheticAuthorization(KERNEL_IMPLEMENTATION)] });
+const firstUseProof = await proveKernelDelegationAtTransaction({
+  wallet,
+  transaction: firstUseTarget,
+  block: { transactions: [firstUseTarget] },
+  parentWalletCode: "0x",
+  parentWalletNonce: 0n,
+  parentRootValidator: zeroRootValidatorResult,
+  recoverAuthority: async () => wallet,
+});
+equal("first-use delegation parent state", firstUseProof.parentState, "empty");
+equal("first-use recovered authority", firstUseProof.observedWalletAuthorizations[0].authority, wallet);
+equal("first-use reviewed target", firstUseProof.observedWalletAuthorizations[0].target, KERNEL_IMPLEMENTATION);
+
+await rejectsAsync("reject malicious delegation target", () => {
+  const malicious = syntheticTransaction(0, { type: "0x4", authorizations: [syntheticAuthorization(otherWallet, 7n)] });
+  const target = syntheticTransaction(1);
+  return proveKernelDelegationAtTransaction({
+    wallet, transaction: target, block: { transactions: [malicious, target] },
+    parentWalletCode: KERNEL_DELEGATION_DESIGNATOR, parentWalletNonce: 7n,
+    parentRootValidator: zeroRootValidatorResult, recoverAuthority: async () => wallet,
+  });
+}, "non-reviewed EIP-7702 authorization");
+await rejectsAsync("reject wrong first-use authorization nonce", () => {
+  const target = syntheticTransaction(0, { type: "0x4", authorizations: [syntheticAuthorization(KERNEL_IMPLEMENTATION, 1n)] });
+  return proveKernelDelegationAtTransaction({
+    wallet, transaction: target, block: { transactions: [target] }, parentWalletCode: "0x",
+    parentWalletNonce: 0n, parentRootValidator: zeroRootValidatorResult, recoverAuthority: async () => wallet,
+  });
+}, "authorization nonce");
+await rejectsAsync("reject nonzero root validator", () => proveKernelDelegationAtTransaction({
+  wallet, transaction: persistentTarget, block: { transactions: [persistentTarget] },
+  parentWalletCode: KERNEL_DELEGATION_DESIGNATOR, parentWalletNonce: 7n,
+  parentRootValidator: `0x01${"0".repeat(62)}`, recoverAuthority: async () => wallet,
+}), "rootValidator was nonzero");
+
+// Public RPCs have different historical-state retention. A pruned-state error
+// is endpoint-specific and may move a read to the next configured public RPC,
+// which must then become the preferred endpoint. An execution revert is a
+// semantic result from the requested call and must remain fail-closed even when
+// it uses the same broad -32603 server-error code.
+const originalFetch = globalThis.fetch;
+const originalStonkRpc = process.env.STONK_GACHA_RPC_URL;
+const originalBaseRpc = process.env.BASE_RPC_URL;
+delete process.env.STONK_GACHA_RPC_URL;
+delete process.env.BASE_RPC_URL;
+try {
+  const fallbackCalls = [];
+  globalThis.fetch = async (url) => {
+    fallbackCalls.push(String(url));
+    const body = String(url).includes("base-rpc.publicnode.com")
+      ? { jsonrpc: "2.0", id: 1, error: { code: -32603, message: "state at block 50487407 is pruned" } }
+      : { jsonrpc: "2.0", id: 1, result: "0x2a" };
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const fallbackChain = await import(`./lib/chain.mjs?selftest-pruned-fallback=${Date.now()}`);
+  equal("pruned historical state falls back", await fallbackChain.rpc("eth_getBalance", [wallet, "0x302644f"]), "0x2a");
+  equal("successful fallback remains preferred", await fallbackChain.rpc("eth_getBalance", [wallet, "0x302644f"]), "0x2a");
+  deepEqual("pruned endpoint is tried once then fallback is re-pinned", fallbackCalls, [
+    "https://base-rpc.publicnode.com",
+    "https://base-mainnet.public.blastapi.io",
+    "https://base-mainnet.public.blastapi.io",
+  ]);
+
+  const revertCalls = [];
+  globalThis.fetch = async (url) => {
+    revertCalls.push(String(url));
+    const body = String(url).includes("base-rpc.publicnode.com")
+      ? { jsonrpc: "2.0", id: 1, error: { code: -32603, message: "execution reverted", data: "0xdeadbeef" } }
+      : { jsonrpc: "2.0", id: 1, result: "0x2a" };
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const strictChain = await import(`./lib/chain.mjs?selftest-revert-fail-closed=${Date.now()}`);
+  let capturedRevert = null;
+  try {
+    await strictChain.rpc("eth_call", [{ to: ADDR.gacha, data: "0xdeadbeef" }, "latest"]);
+  } catch (error) {
+    capturedRevert = error;
+  }
+  check("execution-reverted -32603 remains RpcError", capturedRevert instanceof strictChain.RpcError, capturedRevert?.message);
+  equal("execution-reverted -32603 code preserved", capturedRevert?.code, -32603);
+  equal("execution-reverted -32603 data preserved", capturedRevert?.data, "0xdeadbeef");
+  deepEqual("execution revert does not reroute", revertCalls, ["https://base-rpc.publicnode.com"]);
+
+  let estimateRequest = null;
+  globalThis.fetch = async (_url, options) => {
+    estimateRequest = JSON.parse(options.body);
+    return { ok: true, status: 200, json: async () => ({ jsonrpc: "2.0", id: 1, result: "0x5208" }) };
+  };
+  const estimateChain = await import(`./lib/chain.mjs?selftest-pinned-estimate=${Date.now()}`);
+  const estimateBlock = { blockHash: keccak256("pinned-estimate-block"), requireCanonical: true };
+  equal(
+    "estimateGas decodes pinned estimate",
+    await estimateChain.estimateGas(ADDR.gacha, "0x12345678", wallet, 7n, estimateBlock),
+    21_000n,
+  );
+  equal("estimateGas RPC method", estimateRequest?.method, "eth_estimateGas");
+  deepEqual("estimateGas carries EIP-1898 block ref", estimateRequest?.params?.[1], estimateBlock);
+  equal("estimateGas carries logical value", estimateRequest?.params?.[0]?.value, "0x7");
+} finally {
+  globalThis.fetch = originalFetch;
+  if (originalStonkRpc === undefined) delete process.env.STONK_GACHA_RPC_URL;
+  else process.env.STONK_GACHA_RPC_URL = originalStonkRpc;
+  if (originalBaseRpc === undefined) delete process.env.BASE_RPC_URL;
+  else process.env.BASE_RPC_URL = originalBaseRpc;
+}
+
+// Reference pins, install metadata, size limits, and cross-project contamination.
+equal("deployment chain", DEPLOYMENT.chainId, 8453);
+equal("reviewed source commit", DEPLOYMENT.release.sourceCommit, "c8d4b49e4f72fb39461ab93008e80308a2886b7c");
+equal("Gacha address pin", ADDR.gacha, "0xfd2c0eaf1b4b46593a3887fec4af30ac4245687f");
+equal("Treasury address pin", ADDR.treasury, "0x5da6595e587ac968e8355e2f5312fbe1967d6e1c");
+equal("USDC address pin", ADDR.usdc, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913");
+equal("USDC implementation slot pin", DEPLOYMENT.tokens.usdc.zeppelinosImplementationSlot, "0x7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3");
+equal("USDC implementation address pin", ADDR.usdcImplementation, "0x2ce6311ddae708829bc0784c967b7d77d19fd779");
+equal("USDC implementation hash pin", DEPLOYMENT.tokens.usdc.implementationRuntimeCodeHash, "0x11b75a237997ab8328f65b2d5a55c10f0346d0a175741ed42ddf4f2c66b9e873");
+check("USDC proxy and implementation hashes are independently pinned", DEPLOYMENT.tokens.usdc.runtimeCodeHash !== DEPLOYMENT.tokens.usdc.implementationRuntimeCodeHash);
+equal("worker bounty pin", DEPLOYMENT.productTerms.workerBountyBps, 100);
+equal("minimum distribution pin", DEPLOYMENT.productTerms.minimumDistributeUsdcRaw, 10_000_000);
+equal("Bankr EntryPoint pin", BANKR_EXECUTION.sponsored.entryPoint.address.toLowerCase(), ENTRY_POINT_V07);
+equal("Bankr EntryPoint hash pin", BANKR_EXECUTION.sponsored.entryPoint.runtimeCodeHash, ENTRY_POINT_V07_CODE_HASH);
+equal("Bankr Kernel pin", BANKR_EXECUTION.sponsored.account.implementation, KERNEL_IMPLEMENTATION);
+equal("Bankr Kernel hash pin", BANKR_EXECUTION.sponsored.account.implementationRuntimeCodeHash, KERNEL_IMPLEMENTATION_CODE_HASH);
+equal("Bankr validation slot pin", BANKR_EXECUTION.sponsored.account.validationStorageSlot, KERNEL_VALIDATION_STORAGE_SLOT);
+check("Bankr policy requires fail-on-error single call", BANKR_EXECUTION.policy.requireSingleLogicalCall && BANKR_EXECUTION.policy.requireFailOnError);
+check("Bankr policy rejects batches and paymaster", BANKR_EXECUTION.policy.rejectWalletBatch && BANKR_EXECUTION.sponsored.account.requireEmptyPaymasterAndData);
+equal("Bankr live fixture count", BANKR_EXECUTION.sponsored.liveRegressionFixtures.length, 3);
+equal("Bankr direct live fixture count", BANKR_EXECUTION.direct.liveRegressionFixtures.length, 1);
+equal("acquisition stays Bankr-native", BANKR_EXECUTION.acquisition.mode, "separate-bankr-native-trade");
+equal("local acquisition calldata is forbidden", BANKR_EXECUTION.acquisition.localSwapCalldata, "forbidden");
+check("acquisition continuation requires mined trade and fresh USDC read", /mined Bankr-native trade receipt.*fresh planner read.*official Base USDC/.test(BANKR_EXECUTION.acquisition.continuationGate));
+check("acquisition makes no unenforced transfer-log claim", !Object.hasOwn(BANKR_EXECUTION.acquisition, "requireCanonicalTransferLogs"));
+check("acquisition makes no unenforced source-asset claim", !Object.hasOwn(BANKR_EXECUTION.acquisition, "rejectOtherSourceAssets") && !Object.hasOwn(BANKR_EXECUTION.acquisition, "provenSourceAssets"));
+
+const skillMarkdown = readFileSync(new URL("../SKILL.md", import.meta.url), "utf8");
+const catalog = JSON.parse(readFileSync(new URL("../catalog.json", import.meta.url), "utf8"));
+const frontmatter = skillMarkdown.match(/^---\n([\s\S]*?)\n---(?:\n|$)/)?.[1] ?? "";
+equal("Bankr skill name", frontmatter.match(/^name:\s*(.+)$/m)?.[1]?.trim(), "stonk-gacha");
+check("Bankr skill description exists", /^description:\s*\S.+$/m.test(frontmatter));
+check("Bankr top-level tags exist", /^tags:\s*\[[^\]]+\]$/m.test(frontmatter));
+equal("Bankr top-level version", Number(frontmatter.match(/^version:\s*(\d+)$/m)?.[1]), 1);
+equal("Bankr top-level visibility", frontmatter.match(/^visibility:\s*(\S+)$/m)?.[1], "public");
+equal("catalog slug", catalog.slug, "stonk-gacha");
+equal("catalog schema", catalog.schemaVersion, 1);
+equal("catalog repo path", catalog.install.repoPath, ".");
+check("catalog points at public source", catalog.install.command.includes("github.com/panikadak/stonk-gacha-bankr-skill"));
+
+for (const relative of [
+  "SKILL.md", "references/operations.md", "references/bankr-execution.md",
+  "references/deployment.json", "references/signing-allowlist.json", "references/bankr-execution.json",
+]) {
+  try {
+    const bytes = statSync(new URL(`../${relative}`, import.meta.url)).size;
+    check(`${relative} under 100 KB`, bytes < 100_000, `${bytes} bytes`);
+  } catch (error) {
+    check(`${relative} exists`, false, error.message);
+  }
+}
+check("SKILL.md under Bankr 1 MB limit", statSync(new URL("../SKILL.md", import.meta.url)).size < 1_000_000);
+
+const scanFiles = [];
+function collectFiles(directory, prefix = "") {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (entry.name === ".git" || entry.name === "node_modules") continue;
+    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const absolute = new URL(`../${relative}`, import.meta.url);
+    if (entry.isDirectory()) collectFiles(absolute, relative);
+    else if (relative !== "scripts/selftest.mjs") scanFiles.push(relative);
+  }
+}
+collectFiles(new URL("../", import.meta.url));
+const contaminationPatterns = [
+  ["legacy project name", new RegExp(["PUNK", "TOWN"].join(""), "i")],
+  ["legacy desk name", new RegExp(["PUNK", "AMM"].join(""), "i")],
+  ["legacy token symbol", new RegExp(`\\b${["BA", "ES"].join("")}\\b`, "i")],
+  ["legacy desk address", new RegExp(["0x555c246d004d2f24", "b5baddd186fc773eb6fb8445"].join(""), "i")],
+];
+for (const [label, pattern] of contaminationPatterns) {
+  const matches = scanFiles.filter((relative) => {
+    try { return pattern.test(readFileSync(new URL(`../${relative}`, import.meta.url), "utf8")); }
+    catch { return false; }
+  });
+  check(`no ${label} contamination`, matches.length === 0, matches.join(", "));
+}
+
+async function liveDelegationProof(transaction, receipt, activeWallet) {
+  const receiptBlock = await getBlockByHash(receipt.blockHash, true);
+  const parentBlockRef = { blockHash: receiptBlock.parentHash, requireCanonical: true };
+  const [parentWalletCode, parentWalletNonce] = await Promise.all([
+    getCode(activeWallet, parentBlockRef),
+    getTransactionCount(activeWallet, parentBlockRef),
+  ]);
+  let parentRootValidator;
+  if (parentWalletCode === "0x") {
+    equal("live empty parent has no retained validation state", await getStorageAt(activeWallet, KERNEL_VALIDATION_STORAGE_SLOT, parentBlockRef), zeroRootValidatorResult);
+    parentRootValidator = zeroRootValidatorResult;
+  } else {
+    parentRootValidator = await ethCall(activeWallet, ROOT_VALIDATOR_SELECTOR, { block: parentBlockRef });
+  }
+  return await proveKernelDelegationAtTransaction({
+    wallet: activeWallet,
+    transaction,
+    block: receiptBlock,
+    parentWalletCode,
+    parentWalletNonce,
+    parentRootValidator,
+    recoverAuthority: async (authorization) => decodeAuthorizationAuthority(await ethCall(
+      ECRECOVER_PRECOMPILE,
+      authorization.callData,
+      { block: parentBlockRef },
+    )),
+  });
+}
+
+if (LIVE) {
+  const snapshot = await beginSnapshot();
+  const integrity = await verifyDeployment(snapshot);
+  check("live deployment integrity", integrity.ok, integrity.failed?.join(", "));
+  equal("live deployment release pin", integrity.release.sourceCommit, DEPLOYMENT.release.sourceCommit);
+  equal("live snapshot block hash", integrity.snapshot.blockHash, snapshot.hash);
+  const liveUsdcImplementationWord = await getStorageAt(ADDR.usdc, DEPLOYMENT.tokens.usdc.zeppelinosImplementationSlot, snapshot.ref);
+  equal("live USDC implementation address", `0x${liveUsdcImplementationWord.slice(-40)}`, ADDR.usdcImplementation);
+  equal("live USDC implementation runtime", await getCodeHash(ADDR.usdcImplementation, snapshot.ref), DEPLOYMENT.tokens.usdc.implementationRuntimeCodeHash);
+  check("live deployment gate includes USDC implementation address", integrity.checks.some((entry) => entry.name === "USDCProxy.implementation" && entry.pass));
+  check("live deployment gate includes USDC implementation runtime", integrity.checks.some((entry) => entry.name === "USDCImplementation.runtimeCodeHash" && entry.pass));
+
+  const offers = [];
+  for (let packIndex = 0; packIndex < DEPLOYMENT.productTerms.packCount; packIndex += 1) {
+    const offer = await readOffer(packIndex, snapshot);
+    offers.push(offer);
+    equal(`live offer ${packIndex} index`, offer.packIndex, packIndex);
+    equal(`live offer ${packIndex} price`, BigInt(offer.priceUsdc), BigInt(DEPLOYMENT.productTerms.packPricesUsdcRaw[packIndex]));
+    check(`live offer ${packIndex} has eligible stocks`, offer.eligible.length >= 1 && offer.eligible.length <= 16);
+    equal(`live offer ${packIndex} token/route count`, offer.eligible.filter((entry) => entry.routeHash).length, offer.eligible.length);
+    check(`live offer ${packIndex} nonzero ceiling`, BigInt(offer.ceilingBps) >= BigInt(DEPLOYMENT.productTerms.minimumCeilingBps));
+    check(`live offer ${packIndex} cash backed`, BigInt(offer.maxPayoutUsdc) <= BigInt(offer.freeReserveUsdc));
+    check(`live offer ${packIndex} nonzero Entropy fee`, BigInt(offer.entropyFee) > 0n);
+    const local = localOfferHash(
+      packIndex,
+      BigInt(offer.ceilingBps),
+      offer.eligible.map((entry) => entry.token),
+      offer.eligible.map((entry) => entry.routeHash),
+    );
+    equal(`live offer ${packIndex} local ordered commitment`, local, offer.offerHash);
+    equal(`live offer ${packIndex} helper commitment`, offer.computedOfferHash, offer.offerHash);
+  }
+  equal("live all three offers available", offers.length, 3);
+  const delivered = await readRequest(569705n, snapshot);
+  const status = await protocolStatus(null, snapshot);
+  const profit = await profitStatus(null, snapshot);
+  const requestPage = await walletRequests(delivered.buyer, 0n, 1n, snapshot);
+  equal("optional-snapshot request read stays pinned", delivered.snapshot.blockHash, snapshot.hash);
+  equal("optional-snapshot status read stays pinned", status.snapshot.blockHash, snapshot.hash);
+  equal("optional-snapshot profit read stays pinned", profit.snapshot.blockHash, snapshot.hash);
+  equal("optional-snapshot request page stays pinned", requestPage.snapshot.blockHash, snapshot.hash);
+  await confirmSnapshot(snapshot);
+
+  equal("known request id", BigInt(delivered.requestId), 569705n);
+  equal("known request is Delivered", delivered.status, "Delivered");
+  equal("known request pack index", BigInt(delivered.packIndex), 0n);
+  equal("known request paid 5 USDC", BigInt(delivered.paidUsdc), 5_000_000n);
+  equal("known request 1x multiplier", BigInt(delivered.multiplierBps), 10_000n);
+  equal("known request payout equals charge", BigInt(delivered.payoutUsdc), 5_000_000n);
+  equal("known request stock output", BigInt(delivered.stockOut), 2_297_456n);
+  check("known request has nonzero selected token", normalizeAddress(delivered.token) !== "0x0000000000000000000000000000000000000000");
+  const chosen = delivered.eligible.find((entry) => normalizeAddress(entry.token) === normalizeAddress(delivered.token));
+  check("known request token remains in pinned set", Boolean(chosen));
+  equal("known request route matches pinned token", chosen?.routeHash?.toLowerCase(), delivered.routeHash.toLowerCase());
+  check("known request delivery output is nonzero", BigInt(delivered.stockOut) > 0n);
+
+  check("live protocol status passes deployment gate", status.ok === true);
+  check("live salesPaused is boolean", typeof status.salesPaused === "boolean");
+  equal("live status contains three offer slots", status.offers.length, 3);
+  const ledger = Object.fromEntries(Object.entries(status.ledger).map(([key, value]) => [key, typeof value === "boolean" ? value : BigInt(value)]));
+  equal("protected liability identity", ledger.protectedUsdc, ledger.pendingPayoutUsdc + ledger.readyPayoutUsdc + ledger.refundableUsdc);
+  check("protected liabilities are solvent", ledger.protectedUsdc >= 0n && ledger.freeReserveUsdc >= 0n);
+  check("pending count is bounded", ledger.pendingRequests <= ledger.totalRequests);
+  check("distributable is bounded by free cash", ledger.distributableProfitUsdc <= ledger.freeReserveUsdc);
+  check("distributable is bounded by accounting profit", ledger.distributableProfitUsdc <= ledger.accountingProfitAvailableUsdc);
+  equal(
+    "processed profit split identity",
+    ledger.cumulativeProcessedProfitUsdc,
+    ledger.cumulativeProfitBountyUsdc + ledger.cumulativeRetainedProfitUsdc + ledger.cumulativeStakerProfitUsdc,
+  );
+  equal("profit split retained and staker totals", ledger.cumulativeRetainedProfitUsdc, ledger.cumulativeStakerProfitUsdc);
+  check("cumulative refunds do not exceed revenue", ledger.cumulativeRefundedUsdc <= ledger.cumulativeRevenueUsdc);
+  const statusBlock = { blockHash: status.snapshot.blockHash, requireCanonical: true };
+  const gachaUsdc = await readUint(ADDR.usdc, SIG.balanceOf, ["address"], [ADDR.gacha], statusBlock);
+  equal("raw USDC conservation", gachaUsdc, ledger.protectedUsdc + ledger.freeReserveUsdc);
+
+  for (const [fixtureIndex, fixture] of BANKR_EXECUTION.sponsored.liveRegressionFixtures.entries()) {
+    const [transaction, receipt] = await Promise.all([
+      getTransaction(fixture.transactionHash),
+      getReceipt(fixture.transactionHash),
+    ]);
+    check(`Bankr fixture ${fixtureIndex + 1} transaction exists`, Boolean(transaction));
+    check(`Bankr fixture ${fixtureIndex + 1} receipt exists`, Boolean(receipt));
+    if (!transaction || !receipt) continue;
+    equal(`Bankr fixture ${fixtureIndex + 1} outer success`, BigInt(receipt.status), 1n);
+    const envelope = decodeBankrExecution(transaction, fixture.wallet);
+    equal(`Bankr fixture ${fixtureIndex + 1} sponsored mode`, envelope.mode, "bankr-entrypoint-kernel-single");
+    equal(`Bankr fixture ${fixtureIndex + 1} logical sender`, envelope.logicalSender, fixture.wallet.toLowerCase());
+    equal(`Bankr fixture ${fixtureIndex + 1} native validation mode`, envelope.validation.mode, 0);
+    equal(`Bankr fixture ${fixtureIndex + 1} native validation type`, envelope.validation.type, 0);
+    equal(`Bankr fixture ${fixtureIndex + 1} no paymaster`, envelope.userOperation.paymasterAndData, "0x");
+    if (fixture.userOperationIndex !== undefined) equal(`Bankr fixture ${fixtureIndex + 1} userOp index`, envelope.userOperation.index, fixture.userOperationIndex);
+    if (fixture.bundleSize !== undefined) equal(`Bankr fixture ${fixtureIndex + 1} bundle size`, envelope.userOperationCount, fixture.bundleSize);
+    if (fixture.erc8021BuilderCode) equal(`Bankr fixture ${fixtureIndex + 1} attribution`, envelope.attribution?.codes?.[0], fixture.erc8021BuilderCode);
+    equal(`Bankr fixture ${fixtureIndex + 1} EntryPoint runtime`, await getCodeHash(ENTRY_POINT_V07, receipt.blockNumber), ENTRY_POINT_V07_CODE_HASH);
+    equal(`Bankr fixture ${fixtureIndex + 1} Kernel runtime`, await getCodeHash(KERNEL_IMPLEMENTATION, receipt.blockNumber), KERNEL_IMPLEMENTATION_CODE_HASH);
+    equal(`Bankr fixture ${fixtureIndex + 1} receipt-block delegation`, (await getCode(fixture.wallet, receipt.blockNumber)).toLowerCase(), KERNEL_DELEGATION_DESIGNATOR);
+    const computedUserOpHash = decodeBytes32(await ethCall(
+      envelope.entryPoint,
+      userOperationHashCall(envelope),
+      { block: receipt.blockNumber },
+    ));
+    if (fixture.userOpHash) equal(`Bankr fixture ${fixtureIndex + 1} pinned userOp hash`, computedUserOpHash, fixture.userOpHash);
+    const receiptProof = verifyBankrExecutionReceipt(envelope, receipt, computedUserOpHash);
+    check(`Bankr fixture ${fixtureIndex + 1} logical success`, receiptProof.success);
+    equal(`Bankr fixture ${fixtureIndex + 1} proved sender`, receiptProof.sender, fixture.wallet.toLowerCase());
+    const delegation = await liveDelegationProof(transaction, receipt, fixture.wallet);
+    if (fixture.transactionType === 4) {
+      equal(`Bankr fixture ${fixtureIndex + 1} type-4 transaction`, BigInt(transaction.type), 4n);
+      equal(`Bankr fixture ${fixtureIndex + 1} empty parent`, delegation.parentState, "empty");
+      equal(`Bankr fixture ${fixtureIndex + 1} one wallet authorization`, delegation.observedWalletAuthorizations.length, 1);
+      equal(`Bankr fixture ${fixtureIndex + 1} authorization target`, delegation.observedWalletAuthorizations[0].target, fixture.authorizationTarget);
+      equal(`Bankr fixture ${fixtureIndex + 1} authorization chain`, delegation.observedWalletAuthorizations[0].chainId, BigInt(fixture.authorizationChainId));
+      equal(`Bankr fixture ${fixtureIndex + 1} authorization nonce`, delegation.observedWalletAuthorizations[0].nonce, BigInt(fixture.authorizationNonce));
+    } else {
+      equal(`Bankr fixture ${fixtureIndex + 1} persistent parent`, delegation.parentState, "reviewed-kernel");
+    }
+    equal(`Bankr fixture ${fixtureIndex + 1} zero parent validator`, delegation.parentRootValidator, `0x${"0".repeat(42)}`);
+  }
+  for (const [fixtureIndex, fixture] of BANKR_EXECUTION.direct.liveRegressionFixtures.entries()) {
+    const [transaction, receipt] = await Promise.all([
+      getTransaction(fixture.transactionHash),
+      getReceipt(fixture.transactionHash),
+    ]);
+    check(`Bankr direct fixture ${fixtureIndex + 1} transaction exists`, Boolean(transaction));
+    check(`Bankr direct fixture ${fixtureIndex + 1} receipt exists`, Boolean(receipt));
+    if (!transaction || !receipt) continue;
+    equal(`Bankr direct fixture ${fixtureIndex + 1} outer success`, BigInt(receipt.status), 1n);
+    const envelope = decodeBankrExecution(transaction, fixture.wallet);
+    equal(`Bankr direct fixture ${fixtureIndex + 1} mode`, envelope.mode, fixture.mode);
+    equal(`Bankr direct fixture ${fixtureIndex + 1} sender`, envelope.logicalSender, fixture.wallet.toLowerCase());
+    equal(`Bankr direct fixture ${fixtureIndex + 1} outer bytes`, (transaction.input.length - 2) / 2, fixture.outerInputBytes);
+    equal(`Bankr direct fixture ${fixtureIndex + 1} logical bytes`, (envelope.logicalCall.data.length - 2) / 2, fixture.logicalInputBytes);
+    equal(`Bankr direct fixture ${fixtureIndex + 1} attribution schema`, envelope.attribution?.schemaId, fixture.erc8021Schema);
+    equal(`Bankr direct fixture ${fixtureIndex + 1} attribution code`, envelope.attribution?.codes?.[0], fixture.erc8021BuilderCode);
+    equal(`Bankr direct fixture ${fixtureIndex + 1} logical action`, knownActionBySelector(envelope.logicalCall.target, envelope.logicalCall.data.slice(0, 10))?.name, "claim-prize");
+  }
+} else {
+  skip("live deployment, offers, request, and accounting", "run with --live to execute read-only Base checks");
+  skip("live Bankr single and multi-user fixtures", "run with --live to verify historical Base receipts");
+  skip("live Bankr first-use EIP-7702 fixture", "run with --live to prove historical authorization ordering");
+  skip("live Bankr direct ERC-8021 fixture", "run with --live to verify direct attribution stripping");
+}
+
+const failed = results.filter((result) => result.status === "fail");
+const passed = results.filter((result) => result.status === "pass");
+const skipped = results.filter((result) => result.status === "skip");
+for (const result of results) {
+  const label = result.status === "pass" ? "PASS" : result.status === "fail" ? "FAIL" : "SKIP";
+  console.error(`${label}  ${result.name}${result.detail ? `  (${result.detail})` : ""}`);
+}
+console.log(JSON.stringify({
+  ok: failed.length === 0,
+  mode: LIVE ? "live-read-only" : "offline",
+  checks: passed.length + failed.length,
+  passed: passed.length,
+  failed: failed.length,
+  skipped: skipped.length,
+  failures: failed.map((result) => result.name),
+}));
+process.exitCode = failed.length === 0 ? 0 : 1;

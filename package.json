@@ -1,0 +1,18 @@
+{
+  "name": "stonk-gacha-bankr-skill",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Deterministic Bankr wallet planner and verifier for Stonk Gacha on Base",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "check:syntax": "node --check scripts/stonk-gacha.mjs && node --check scripts/selftest.mjs && node --check scripts/lib/abi.mjs && node --check scripts/lib/bankr.mjs && node --check scripts/lib/chain.mjs && node --check scripts/lib/keccak256.mjs && node --check scripts/lib/protocol.mjs",
+    "test": "node scripts/selftest.mjs",
+    "test:live": "node scripts/selftest.mjs --live",
+    "test:fork": "RUN_BASE_B20_FORK=1 base-forge test --match-path test/StonkGachaBankrFork.t.sol -vv",
+    "check": "npm run check:syntax && npm test"
+  },
+  "license": "MIT"
+}

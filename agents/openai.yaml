@@ -1,0 +1,7 @@
+interface:
+  display_name: "Stonk Gacha"
+  short_description: "Plan safe Stonk Gacha actions through Bankr"
+  brand_color: "#52D273"
+  icon_small: "./logo.svg"
+  icon_large: "./logo.svg"
+  default_prompt: "Use $stonk-gacha to inspect my requests or safely plan a Stonk Gacha action on Base through my active Bankr wallet."

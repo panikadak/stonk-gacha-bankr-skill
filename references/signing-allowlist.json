@@ -1,0 +1,114 @@
+{
+  "schemaVersion": 1,
+  "chainId": 8453,
+  "defaultDeny": true,
+  "maxTransactionsPerPlan": 1,
+  "targets": {
+    "usdc": {
+      "addressRef": "tokens.usdc.address",
+      "operations": {
+        "approve": {
+          "signature": "approve(address,uint256)",
+          "selector": "0x095ea7b3",
+          "inputTypes": ["address", "uint256"],
+          "valueRule": "zero",
+          "contextActions": ["open-pack", "fund-reserve", "revoke-usdc"],
+          "rules": ["spender-is-stonk-gacha", "amount-is-zero-reset-or-exact-fresh-plan"]
+        }
+      }
+    },
+    "stonkGacha": {
+      "addressRef": "contracts.stonkGacha.address",
+      "operations": {
+        "open-pack": {
+          "signature": "openPack(uint256,uint256,bytes32,bytes32)",
+          "selector": "0x19b4242f",
+          "inputTypes": ["uint256", "uint256", "bytes32", "bytes32"],
+          "valueRule": "exact-live-entropy-fee",
+          "contextActions": ["open-pack"]
+        },
+        "claim-prize": {
+          "signature": "claimPrize(uint256,uint256,uint256)",
+          "selector": "0xf6c94230",
+          "inputTypes": ["uint256", "uint256", "uint256"],
+          "valueRule": "zero",
+          "contextActions": ["claim-prize"]
+        },
+        "claim-prize-to": {
+          "signature": "claimPrizeTo(uint256,address,uint256,uint256)",
+          "selector": "0x1027c6d1",
+          "inputTypes": ["uint256", "address", "uint256", "uint256"],
+          "valueRule": "zero",
+          "contextActions": ["claim-prize"]
+        },
+        "expire-request": {
+          "signature": "expireRequest(uint256)",
+          "selector": "0x7e67ef12",
+          "inputTypes": ["uint256"],
+          "valueRule": "zero",
+          "contextActions": ["expire-request"]
+        },
+        "claim-refund": {
+          "signature": "claimRefund(uint256)",
+          "selector": "0x5b7baf64",
+          "inputTypes": ["uint256"],
+          "valueRule": "zero",
+          "contextActions": ["claim-refund"]
+        },
+        "claim-refund-to": {
+          "signature": "claimRefundTo(uint256,address)",
+          "selector": "0x737a0a1a",
+          "inputTypes": ["uint256", "address"],
+          "valueRule": "zero",
+          "contextActions": ["claim-refund"]
+        },
+        "fund-reserve": {
+          "signature": "fundReserve(uint256)",
+          "selector": "0x75c54224",
+          "inputTypes": ["uint256"],
+          "valueRule": "zero",
+          "contextActions": ["fund-reserve"]
+        },
+        "distribute-profit": {
+          "signature": "distributeProfit(uint256,uint256,uint256)",
+          "selector": "0x077317e3",
+          "inputTypes": ["uint256", "uint256", "uint256"],
+          "valueRule": "zero",
+          "contextActions": ["distribute-profit"]
+        }
+      }
+    }
+  },
+  "explicitlyDenied": [
+    {
+      "targetRef": "contracts.stonkGacha.address",
+      "signature": "setSalesPaused(bool)",
+      "selector": "0x8b2170ec",
+      "reason": "owner-only sales configuration"
+    },
+    {
+      "targetRef": "contracts.stonkGacha.address",
+      "signature": "wireTreasury(address)",
+      "selector": "0x0c6c7b59",
+      "reason": "owner-only one-shot wiring"
+    },
+    {
+      "targetRef": "contracts.stonkGacha.address",
+      "signature": "recoverExcess(uint8,address,uint256,address)",
+      "selector": "0x4f35d89b",
+      "reason": "owner-only recovery"
+    },
+    {
+      "targetRef": "contracts.stonkGacha.address",
+      "signature": "_entropyCallback(uint64,address,bytes32)",
+      "selector": "0x52a5f1f8",
+      "reason": "authenticated Pyth callback"
+    },
+    {
+      "targetRef": "contracts.gachaTreasury.address",
+      "signature": "*",
+      "selector": null,
+      "reason": "every Treasury write is Gacha-only or owner-only; users never sign directly to Treasury"
+    }
+  ]
+}

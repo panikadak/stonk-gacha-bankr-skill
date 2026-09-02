@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "slug": "stonk-gacha",
+  "provider": "Bario Entertainment System",
+  "providerUrl": "https://punk.town/#/gacha",
+  "logo": "logo.svg",
+  "demo": {
+    "title": "stonk-gacha-bankr-session.txt",
+    "language": "text",
+    "code": "You:   Open a 10 USDC Stonk Gacha pack\nBankr: I checked the live Base deployment at one pinned block. I will show the current cash-backed ceiling, nominal RTP, eligible stock set, exact Pyth fee, and any exact USDC approval before asking you to continue. A win becomes a USDC purchase budget; the exact stock amount is known only after your later delivery swap.\nYou:   Continue\nBankr: The exact approval mined. I re-read the offer and fee instead of reusing the old plan. Here are the final terms for this one pack..."
+  },
+  "setup": [
+    "Install the skill from its public GitHub repository URL",
+    "Use the active Bankr EVM wallet on Base; never paste or expose a private key",
+    "Keep Wallet API read-write access and arbitrary contract calls enabled for writes",
+    "Run the bundled live self-test once after install or update",
+    "Every write is planned as one unsigned transaction and verified after its mined receipt"
+  ],
+  "install": {
+    "type": "bankr",
+    "repoPath": ".",
+    "command": "install the skill at https://github.com/panikadak/stonk-gacha-bankr-skill"
+  }
+}

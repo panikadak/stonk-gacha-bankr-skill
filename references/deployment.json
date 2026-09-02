@@ -1,0 +1,110 @@
+{
+  "schemaVersion": 1,
+  "chainId": 8453,
+  "network": {
+    "name": "Base",
+    "chainId": 8453,
+    "nativeSymbol": "ETH",
+    "explorer": "https://basescan.org"
+  },
+  "release": {
+    "sourceRepository": "https://github.com/panikadak/punkstreet",
+    "sourceCommit": "c8d4b49e4f72fb39461ab93008e80308a2886b7c",
+    "deployedAt": "2026-09-01",
+    "blockRange": {
+      "from": 50735544,
+      "to": 50735688
+    },
+    "compiler": "v0.8.30+commit.73712a01",
+    "optimizerRuns": 10000,
+    "evmVersion": "cancun"
+  },
+  "owner": "0x702ba46435D1E55B18440100BC81EB055574875e",
+  "contracts": {
+    "stonkGacha": {
+      "name": "StonkGacha",
+      "address": "0xfD2c0EAf1b4B46593a3887feC4aF30Ac4245687F",
+      "deployBlock": 50735544,
+      "runtimeCodeHash": "0xf7f3ddfb5f472c771cefced05b08558ce3a68feecb28b7dfe417173fc2a01908",
+      "sourcePath": "packages/contracts/src/StonkGacha.sol"
+    },
+    "gachaTreasury": {
+      "name": "GachaTreasury",
+      "address": "0x5da6595E587aC968e8355E2f5312FBE1967D6e1c",
+      "deployBlock": 50735670,
+      "runtimeCodeHash": "0x94d0bc2fd7f4b2bda20481ededb24193462754399f598208f68e27f62b4824c0",
+      "sourcePath": "packages/contracts/src/GachaTreasury.sol"
+    },
+    "stockLock": {
+      "name": "StockLock",
+      "address": "0x4570F784d35ab06a0FA22F42bb6329fAA998a6BA",
+      "runtimeCodeHash": "0x81782b61179aac15dcda6f1eb9370ea57844383c5fb8ddafc4ccd81863b3d425"
+    },
+    "stockAdapter": {
+      "name": "AerodromeStockAdapter",
+      "address": "0x3d3abC1569C260953a6f5D42102D2f330A41430c",
+      "runtimeCodeHash": "0x2f6d070ddae41348d80620435e2b2db5a14073a59dc0f8a1884743ee8f68c279",
+      "discovery": "StonkGacha.stockAdapter()"
+    },
+    "slipstreamRouter": {
+      "name": "Aerodrome Slipstream Router",
+      "address": "0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F",
+      "runtimeCodeHash": "0xfedc4e21e1097b0ec1b4f1aa901cf645c22f9e5d297727b0f37275ee1d083df4"
+    },
+    "slipstreamQuoter": {
+      "name": "Aerodrome Slipstream Quoter",
+      "address": "0x514c8B5f54112481E28028F1166Bd78501089259",
+      "runtimeCodeHash": "0x4c4c43e0024343e65597f0f0a1b829aaf69e5a6c0a0148fb63d28ff5730be551"
+    }
+  },
+  "tokens": {
+    "usdc": {
+      "name": "USD Coin",
+      "symbol": "USDC",
+      "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "decimals": 6,
+      "runtimeCodeHash": "0xa6705a10bb756b5dea144591118be77d7af0c3eee3bf2dfe2583dcb0364fefab",
+      "zeppelinosImplementationSlot": "0x7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3",
+      "implementation": "0x2Ce6311ddAE708829bc0784C967b7d77D19FD779",
+      "implementationRuntimeCodeHash": "0x11b75a237997ab8328f65b2d5a55c10f0346d0a175741ed42ddf4f2c66b9e873",
+      "codeHashObservedAtBlock": 50774160,
+      "issuerControlled": true
+    },
+    "weth": {
+      "name": "Wrapped Ether",
+      "symbol": "WETH",
+      "address": "0x4200000000000000000000000000000000000006",
+      "decimals": 18,
+      "runtimeCodeHash": "0x8a3a1f6a9f9dce633117adee5b458245835a8645a8c8726a26382a4622508b1c"
+    }
+  },
+  "entropy": {
+    "proxy": "0x6E7D74FA7d5c90FEF9F0512987605a6d546181Bb",
+    "proxyRuntimeCodeHash": "0xa1bc6c93a3e72eacb608ed6ee310fa55db317bdcac1b8f87999cf78754730ffc",
+    "eip1967ImplementationSlot": "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",
+    "implementation": "0x4ceD698548F7D068f2f6E92D66f404A8A10db83b",
+    "implementationRuntimeCodeHash": "0x3fa48e15f319dc39d223a8deedd6b56c774fabe21837882e27563326c726e1f1",
+    "provider": "0x52DeaA1c84233F7bb8C8A45baeDE41091c616506",
+    "callbackGasLimit": 500000
+  },
+  "productTerms": {
+    "packPricesUsdcRaw": [5000000, 10000000, 20000000],
+    "packCount": 3,
+    "usdcUnit": 1000000,
+    "resolveWindowSeconds": 86400,
+    "targetRtpBps": 8500,
+    "houseEdgeBps": 1500,
+    "minimumCeilingBps": 20000,
+    "minimumDistributeUsdcRaw": 10000000,
+    "maximumDistributeUsdcRaw": 2000000000,
+    "workerBountyBps": 100,
+    "reserveBps": 5000,
+    "stakerBps": 5000
+  },
+  "transactionEvidence": [
+    "0x9cd650c4ba602e61d8c79f16e5c4dab4dccde3768a21d0a3c81717977cc66825",
+    "0x579a19114007de3f5b3d4116dda8bb964fc9bef4cad78af61b72b44cc831a23b",
+    "0x0bc0dc233bcfcd848a5c63153a6c626fb7a780a5722a0a8889620f35b6f3798f",
+    "0x398e13312d8038577f5e87821e0e2e3bffd62b5a8db1809cf0b4abb5ac76292f"
+  ]
+}
