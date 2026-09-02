@@ -25,6 +25,30 @@ export class RpcError extends Error {
   }
 }
 
+// Raised only after the RPC transport/endpoint loop is exhausted. Callers that
+// maintain a bounded read-only watch may retry this error only when `retryable`
+// is true. JSON-RPC semantic errors remain RpcError and are never tagged here.
+export class RpcTransportError extends Error {
+  constructor(message, { retryable = false, cause = null } = {}) {
+    super(message);
+    this.name = "RpcTransportError";
+    this.retryable = retryable === true;
+    this.cause = cause;
+  }
+}
+
+export function isRetryableRpcTransportError(error) {
+  return error instanceof RpcTransportError && error.retryable === true;
+}
+
+function isRetryableTransportFailure(error) {
+  const code = error?.code ?? error?.cause?.code ?? null;
+  return error?.retryable === true
+    || error?.name === "AbortError"
+    || error instanceof TypeError
+    || ["ECONNRESET", "ETIMEDOUT", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH"].includes(code);
+}
+
 function timeoutSignal(milliseconds) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), milliseconds);
@@ -63,6 +87,7 @@ export async function rpc(method, params = []) {
             continue;
           }
           const httpError = new Error(`HTTP ${response.status}`);
+          httpError.retryable = TRANSIENT_HTTP.has(response.status);
           httpError.endpointSpecific = [400, 401, 403, 404, 405].includes(response.status);
           throw httpError;
         }
@@ -96,7 +121,8 @@ export async function rpc(method, params = []) {
     }
   }
   const scope = RPCS.length > 1 ? "all configured Base RPCs" : "the configured Base RPC";
-  throw new Error(`${scope} failed for ${method}: ${lastError.message}`);
+  const retryable = isRetryableTransportFailure(lastError);
+  throw new RpcTransportError(`${scope} failed for ${method}: ${lastError.message}`, { retryable, cause: lastError });
 }
 
 export async function chainId() {

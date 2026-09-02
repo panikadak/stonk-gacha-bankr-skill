@@ -25,9 +25,13 @@
   "directPull": {
     "maximumEntropyFeeWei": "10000000000000",
     "intentTtlSeconds": 600,
-    "claimContinuationTtlSeconds": 600,
-    "pollIntervalSeconds": 5,
-    "maximumSilentWaitSeconds": 600,
+    "claimContinuationTtlSeconds": 172800,
+    "pollIntervalSeconds": 2,
+    "activeWatchSeconds": 300,
+    "maximumActiveWatchSeconds": 3300,
+    "maximumConsecutiveTransportErrors": 8,
+    "maximumTransportBackoffSeconds": 30,
+    "runtimeJournalRoot": "/stonk-gacha/pulls",
     "claimSlippageBps": 300,
     "recipient": "active-wallet-only",
     "requireExactAuthorizedPrice": true,
@@ -191,7 +195,7 @@
     "naturalLanguageSwapPrompt": "forbidden",
     "continuationGate": "every Bankr swap leg reconciled as mined success, then a fresh planner read proving enough canonical Base USDC, enough native Base ETH for exact msg.value plus confirmed headroom, unchanged wallet request count, unchanged offer hash and ceiling, unchanged pack price, and a live Entropy fee at or below the confirmed cap",
     "preSubmitGate": "before signing each funded approval or open, recheck intent expiry, wallet request-count baseline, price, offer hash, ceiling, fee cap, and native ETH for exact live msg.value plus headroom",
-    "remainingOpenReconfirmation": "when funding is complete and only price, offer hash, ceiling, or fee changed while balances, local offer hash, wallet, and request count remain valid, issue a new approve+open-only intent with no swap authority",
+    "remainingOpenReconfirmation": "when funding is complete and only price, offer hash, ceiling, or fee changed while balances, local offer hash, wallet, and request count remain valid, issue a new approve+open+same-resulting-request-claim intent with no swap authority",
     "rawSubmitAmbiguity": "Because /wallet/submit has no documented idempotency field, reconcile allowance plus Bankr activity before approval resend and PackOpened/request state plus Bankr activity before openPack resend."
   }
 }

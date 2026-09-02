@@ -1,13 +1,14 @@
 import { readFileSync } from "node:fs";
 import { formatUnits, jsonValue, normalizeAddress, parseUnits } from "./abi.mjs";
+import { DIRECT_CLAIM_SLIPPAGE_BPS, directUserRandomNumber } from "./direct.mjs";
 import { keccak256 } from "./keccak256.mjs";
 
 export const FUNDING_POLICY = JSON.parse(
   readFileSync(new URL("../../references/funding-policy.json", import.meta.url), "utf8"),
 );
 
-export const FUNDING_KIND = "stonk-gacha-funded-open/v1";
-export const REMAINING_OPEN_KIND = "stonk-gacha-remaining-open/v1";
+export const FUNDING_KIND = "stonk-gacha-funded-open/v2";
+export const REMAINING_OPEN_KIND = "stonk-gacha-remaining-open/v2";
 export const X_PENDING_KIND = "stonk-gacha-x-pending/v1";
 export const NATIVE_SENTINEL = normalizeAddress(FUNDING_POLICY.walletApi.nativeTokenSentinel);
 export const FUNDING_USDC = normalizeAddress(FUNDING_POLICY.canonicalAssets.usdc.address);
@@ -23,6 +24,12 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 const OPAQUE_ID = /^[A-Za-z0-9._:-]{1,256}$/;
 const X_ID = /^[1-9][0-9]{0,24}$/;
 const BYTES32 = /^0x[0-9a-f]{64}$/;
+const DELIVERY_ALLOWED_ACTIONS = [
+  "conditional-allowance-reset",
+  "exact-usdc-approval",
+  "open-pack",
+  "same-request-claim-prize",
+];
 
 function invariant(condition, message) {
   if (!condition) throw new Error(message);
@@ -243,7 +250,7 @@ export function createFundingIntent({
   nativeSwapSlippageBps = null,
   nativeQuoteId = null,
   nativeSwapIdempotencyKey = null,
-  userRandomNumber,
+  claimCapabilitySecret,
   createdAt,
   expiresAt,
 }) {
@@ -263,6 +270,8 @@ export function createFundingIntent({
   const created = BigInt(createdAt);
   const expiry = BigInt(expiresAt);
   const deficit = exactUsdcDeficit(currentUsdc, price);
+  const capability = canonicalBytes32(String(claimCapabilitySecret).toLowerCase(), "funding claim capability secret");
+  const userRandomNumber = directUserRandomNumber(capability);
 
   invariant(Number.isSafeInteger(packIndex) && packIndex >= 0, "pack index is invalid");
   invariant(deficit > 0n, "funding intent requires a current USDC deficit");
@@ -342,7 +351,7 @@ export function createFundingIntent({
 
   const aggregateSourceSpend = sellAmount + nativeTopUpSell;
   return jsonValue({
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: FUNDING_KIND,
     stage: "fund-and-open",
     wallet: account,
@@ -355,6 +364,7 @@ export function createFundingIntent({
       expectedOfferHash,
       acceptedCeilingBps: BigInt(acceptedCeilingBps),
       entropyFeeCapWei: feeCap,
+      claimCapabilitySecret: capability,
       userRandomNumber,
     },
     preflight: {
@@ -385,6 +395,11 @@ export function createFundingIntent({
       exactAmountUsdcRaw: price,
       resetMismatchedNonzeroFirst: true,
     },
+    deliveryPolicy: {
+      recipient: account,
+      slippageBps: DIRECT_CLAIM_SLIPPAGE_BPS,
+    },
+    allowedActions: DELIVERY_ALLOWED_ACTIONS,
     crossChainIncluded: false,
     consumed: false,
   });
@@ -420,7 +435,7 @@ export function rebaseFundingIntentForRemainingOpen(intent, {
   canonicalBytes32(expectedOfferHash, "remaining-open expected offer hash");
   invariant(BigInt(acceptedCeilingBps) > 0n, "remaining-open ceiling must be nonzero");
   return validateFundingIntent(jsonValue({
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: REMAINING_OPEN_KIND,
     stage: "remaining-open",
     wallet: prior.wallet,
@@ -433,7 +448,8 @@ export function rebaseFundingIntentForRemainingOpen(intent, {
       expectedOfferHash,
       acceptedCeilingBps: BigInt(acceptedCeilingBps),
       entropyFeeCapWei: fee,
-      userRandomNumber: prior.pack.userRandomNumber,
+      claimCapabilitySecret: prior.pack.claimCapabilitySecret,
+      userRandomNumber: directUserRandomNumber(prior.pack.claimCapabilitySecret),
     },
     remainingPreflight: {
       baseUsdcRaw: currentUsdc,
@@ -448,7 +464,8 @@ export function rebaseFundingIntentForRemainingOpen(intent, {
       exactAmountUsdcRaw: price,
       resetMismatchedNonzeroFirst: true,
     },
-    allowedActions: ["conditional-allowance-reset", "exact-usdc-approval", "open-pack"],
+    deliveryPolicy: prior.deliveryPolicy,
+    allowedActions: DELIVERY_ALLOWED_ACTIONS,
     crossChainIncluded: false,
     consumed: false,
   }));
@@ -478,26 +495,29 @@ function validateRemainingOpenIntent(intent) {
   invariant(intent && typeof intent === "object" && !Array.isArray(intent), "remaining-open intent must be an object");
   rejectUnknownKeys(intent, [
     "schemaVersion", "kind", "stage", "wallet", "chainId", "createdAt", "expiresAt", "pack",
-    "remainingPreflight", "approvalPolicy", "allowedActions", "crossChainIncluded", "consumed",
+    "remainingPreflight", "approvalPolicy", "deliveryPolicy", "allowedActions", "crossChainIncluded", "consumed",
   ], "remaining-open intent");
-  invariant(intent.schemaVersion === 1 && intent.kind === REMAINING_OPEN_KIND && intent.stage === "remaining-open", "unsupported remaining-open intent schema");
+  invariant(intent.schemaVersion === 2 && intent.kind === REMAINING_OPEN_KIND && intent.stage === "remaining-open", "unsupported remaining-open intent schema");
   invariant(intent.wallet === normalizeAddress(intent.wallet), "remaining-open wallet must be canonical lowercase");
   invariant(intent.chainId === 8453, "remaining-open intent is not for Base");
   const created = canonicalUint(intent.createdAt, "remaining-open createdAt");
   const expiry = canonicalUint(intent.expiresAt, "remaining-open expiresAt");
   invariant(expiry > created && expiry - created <= MAX_INTENT_TTL_SECONDS, "remaining-open intent TTL is invalid");
   invariant(intent.consumed === false && intent.crossChainIncluded === false, "remaining-open intent must begin unconsumed and contain no cross-chain authority");
-  invariant(JSON.stringify(intent.allowedActions) === JSON.stringify(["conditional-allowance-reset", "exact-usdc-approval", "open-pack"]), "remaining-open intent has an unsupported action set");
+  invariant(JSON.stringify(intent.allowedActions) === JSON.stringify(DELIVERY_ALLOWED_ACTIONS), "remaining-open intent has an unsupported action set");
 
-  rejectUnknownKeys(intent.pack, ["packIndex", "priceUsdcRaw", "expectedOfferHash", "acceptedCeilingBps", "entropyFeeCapWei", "userRandomNumber"], "remaining-open pack");
+  rejectUnknownKeys(intent.pack, ["packIndex", "priceUsdcRaw", "expectedOfferHash", "acceptedCeilingBps", "entropyFeeCapWei", "claimCapabilitySecret", "userRandomNumber"], "remaining-open pack");
   invariant(Number.isSafeInteger(intent.pack.packIndex) && intent.pack.packIndex >= 0, "remaining-open pack index is malformed");
   const price = canonicalUint(intent.pack.priceUsdcRaw, "remaining-open pack price");
   canonicalBytes32(intent.pack.expectedOfferHash, "remaining-open expected offer hash");
   const ceiling = canonicalUint(intent.pack.acceptedCeilingBps, "remaining-open accepted ceiling");
   const feeCap = canonicalUint(intent.pack.entropyFeeCapWei, "remaining-open Entropy fee cap");
   invariant(price > 0n && ceiling > 0n && feeCap > 0n, "remaining-open pack terms must be nonzero");
+  canonicalBytes32(intent.pack.claimCapabilitySecret, "remaining-open claim capability secret");
   canonicalBytes32(intent.pack.userRandomNumber, "remaining-open user randomness");
+  invariant(!/^0x0{64}$/.test(intent.pack.claimCapabilitySecret), "remaining-open claim capability secret cannot be zero");
   invariant(!/^0x0{64}$/.test(intent.pack.userRandomNumber), "remaining-open user randomness cannot be zero");
+  invariant(directUserRandomNumber(intent.pack.claimCapabilitySecret) === intent.pack.userRandomNumber, "remaining-open user randomness is not committed to the claim capability secret");
 
   rejectUnknownKeys(intent.remainingPreflight, ["baseUsdcRaw", "baseEthWei", "nativeHeadroomWei", "allowanceUsdcRaw", "walletRequestCount"], "remaining-open preflight");
   const remaining = Object.fromEntries(
@@ -513,6 +533,9 @@ function validateRemainingOpenIntent(intent) {
   invariant(intent.approvalPolicy.spender === normalizeAddress(intent.approvalPolicy.spender), "remaining-open approval spender must be canonical lowercase");
   invariant(canonicalUint(intent.approvalPolicy.exactAmountUsdcRaw, "remaining-open approval exact amount") === price, "remaining-open approval amount differs from the pack price");
   invariant(intent.approvalPolicy.resetMismatchedNonzeroFirst === true, "remaining-open approval policy must reset a mismatched nonzero allowance first");
+  rejectUnknownKeys(intent.deliveryPolicy, ["recipient", "slippageBps"], "remaining-open delivery policy");
+  invariant(intent.deliveryPolicy.recipient === intent.wallet, "remaining-open delivery recipient must be the active wallet");
+  invariant(intent.deliveryPolicy.slippageBps === DIRECT_CLAIM_SLIPPAGE_BPS, "remaining-open delivery slippage differs from policy");
   return intent;
 }
 
@@ -520,9 +543,9 @@ function validateInitialFundingIntent(intent) {
   invariant(intent && typeof intent === "object" && !Array.isArray(intent), "funding intent must be an object");
   rejectUnknownKeys(intent, [
     "schemaVersion", "kind", "stage", "wallet", "chainId", "createdAt", "expiresAt", "pack", "preflight", "remainingPreflight",
-    "source", "minimumBaseUsdcOutputRaw", "fundingLegs", "approvalPolicy", "crossChainIncluded", "consumed",
+    "source", "minimumBaseUsdcOutputRaw", "fundingLegs", "approvalPolicy", "deliveryPolicy", "allowedActions", "crossChainIncluded", "consumed",
   ], "funding intent");
-  invariant(intent.schemaVersion === 1 && intent.kind === FUNDING_KIND, "unsupported funding intent schema");
+  invariant(intent.schemaVersion === 2 && intent.kind === FUNDING_KIND, "unsupported funding intent schema");
   invariant(intent.stage === "fund-and-open", "unsupported funding intent stage");
   invariant(intent.wallet === normalizeAddress(intent.wallet), "funding intent wallet must be canonical lowercase");
   invariant(intent.chainId === 8453, "funding intent is not for Base");
@@ -531,15 +554,18 @@ function validateInitialFundingIntent(intent) {
   invariant(expiry > created && expiry - created <= MAX_INTENT_TTL_SECONDS, "funding intent TTL is invalid");
   invariant(intent.consumed === false, "immutable funding intent must begin unconsumed");
   invariant(intent.crossChainIncluded === false, "combined funding intent cannot contain a cross-chain leg");
-  rejectUnknownKeys(intent.pack, ["packIndex", "priceUsdcRaw", "expectedOfferHash", "acceptedCeilingBps", "entropyFeeCapWei", "userRandomNumber"], "funding intent pack");
+  rejectUnknownKeys(intent.pack, ["packIndex", "priceUsdcRaw", "expectedOfferHash", "acceptedCeilingBps", "entropyFeeCapWei", "claimCapabilitySecret", "userRandomNumber"], "funding intent pack");
   invariant(intent.pack && Number.isSafeInteger(intent.pack.packIndex) && intent.pack.packIndex >= 0, "funding intent pack is malformed");
   const price = canonicalUint(intent.pack.priceUsdcRaw, "pack price");
   canonicalBytes32(intent.pack.expectedOfferHash, "expected offer hash");
   const ceiling = canonicalUint(intent.pack.acceptedCeilingBps, "accepted ceiling");
   const feeCap = canonicalUint(intent.pack.entropyFeeCapWei, "Entropy fee cap");
   invariant(price > 0n && ceiling > 0n && feeCap > 0n, "funding intent pack terms must be nonzero");
+  canonicalBytes32(intent.pack.claimCapabilitySecret, "funding claim capability secret");
   canonicalBytes32(intent.pack.userRandomNumber, "user randomness");
+  invariant(!/^0x0{64}$/.test(intent.pack.claimCapabilitySecret), "funding claim capability secret cannot be zero");
   invariant(!/^0x0{64}$/.test(intent.pack.userRandomNumber), "user randomness cannot be zero");
+  invariant(directUserRandomNumber(intent.pack.claimCapabilitySecret) === intent.pack.userRandomNumber, "funding user randomness is not committed to the claim capability secret");
   invariant(intent.preflight && typeof intent.preflight === "object", "funding intent preflight is missing");
   rejectUnknownKeys(intent.preflight, ["fundingPriceUsdcRaw", "fundingEntropyFeeCapWei", "baseUsdcRaw", "exactDeficitUsdcRaw", "baseEthWei", "baseWethWei", "nativeHeadroomWei", "allowanceUsdcRaw", "walletRequestCount"], "funding intent preflight");
   const preflightValues = Object.fromEntries(
@@ -645,6 +671,10 @@ function validateInitialFundingIntent(intent) {
   invariant(intent.approvalPolicy.spender === normalizeAddress(intent.approvalPolicy.spender), "approval policy spender must be canonical lowercase");
   invariant(canonicalUint(intent.approvalPolicy.exactAmountUsdcRaw, "approval exact amount") === price, "approval exact amount differs from the pack price");
   invariant(intent.approvalPolicy.resetMismatchedNonzeroFirst === true, "approval policy must reset mismatched nonzero allowance first");
+  rejectUnknownKeys(intent.deliveryPolicy, ["recipient", "slippageBps"], "funding delivery policy");
+  invariant(intent.deliveryPolicy.recipient === intent.wallet, "funding delivery recipient must be the active wallet");
+  invariant(intent.deliveryPolicy.slippageBps === DIRECT_CLAIM_SLIPPAGE_BPS, "funding delivery slippage differs from policy");
+  invariant(JSON.stringify(intent.allowedActions) === JSON.stringify(DELIVERY_ALLOWED_ACTIONS), "funding intent has an unsupported action set");
   return intent;
 }
 
@@ -699,24 +729,25 @@ function compactFundingTerms(intent, verb, compactAmounts = false) {
       : ` n=${nativeLeg.amount}W>${nativeLeg.minBuyAmount}E`
     : "";
   const feeDisplay = compactAmounts ? `f64=${compactUint(bound.pack.entropyFeeCapWei)}` : `f=${fee}E`;
-  const action = bound.stage === "remaining-open" ? "approve+open" : "swap+approve+open";
+  const ceilingDisplay = compactAmounts ? `c=${bound.pack.acceptedCeilingBps}` : `c=${bound.pack.acceptedCeilingBps}bp`;
+  const action = bound.stage === "remaining-open" ? "approve+open+claim" : "swap+approve+open+claim";
   const funding = !initialFunding
     ? ""
     : ` s=B/${sourceCode} ${compactAmounts ? "m64" : "m"}=${maximum} ${compactAmounts ? "u64" : "u"}=${minimumUsdc}${topUp}`;
-  return `@bankrbot ${verb} SG do=${action} w64=${compactHex(bound.wallet)} p=${bound.pack.packIndex}:${price}U${funding} h64=${compactHex(bound.pack.expectedOfferHash)} c=${bound.pack.acceptedCeilingBps}bp ${feeDisplay} x=${bound.expiresAt} i64=${key}`;
+  return `@bankrbot ${verb} SG do=${action} w64=${compactHex(bound.wallet)} p=${bound.pack.packIndex}:${price}U${funding} h64=${compactHex(bound.pack.expectedOfferHash)} ${ceilingDisplay} ${feeDisplay} x=${bound.expiresAt} i64=${key}`;
 }
 
 export function xPreparedConfirmation(intent) {
   let text = `${compactFundingTerms(intent, "CONFIRM")} r=YES`;
   if ([...text].length > 280) text = `${compactFundingTerms(intent, "CONFIRM", true)} r=YES`;
-  invariant([...text].length <= 280, "prepared X confirmation exceeds 280 characters");
+  invariant([...text].length <= 280, `prepared X confirmation exceeds 280 characters (${[...text].length})`);
   return text;
 }
 
 export function xSelfContainedCommand(intent) {
   const preparedNeedsCompactAmounts = [...`${compactFundingTerms(intent, "CONFIRM")} r=YES`].length > 280;
   const text = compactFundingTerms(intent, "YES", preparedNeedsCompactAmounts);
-  invariant([...text].length <= 280, "self-contained X command exceeds 280 characters");
+  invariant([...text].length <= 280, `self-contained X command exceeds 280 characters (${[...text].length})`);
   return text;
 }
 

@@ -1,22 +1,23 @@
 # Stonk Gacha Bankr Skill
 
 A deterministic, fail-closed Bankr skill for the live Stonk Gacha deployment on
-Base. Version 4 makes an already-funded pull silent and direct: exact approval,
-one open, asynchronous result polling, and default same-wallet prize delivery
-run under the user's original command. The scripts never store keys, sign,
-broadcast, or manufacture swap calldata.
+Base. An already-funded pull is silent and direct: exact approval, one open, an
+exact-request result watcher, and default same-wallet prize delivery run under
+the user's original command. A private request record preserves safe recovery
+if the Bankr process stops. The scripts never store keys, sign, broadcast, or
+manufacture swap calldata.
 
 ## Install in Bankr
 
-The repository must be public and `SKILL.md` must remain at its root. Tell your
-Bankr agent:
+The repository must be public and `SKILL.md` must remain at its root. For
+install plus an already-funded pull in one X post:
 
 ```text
-install the skill at https://github.com/panikadak/stonk-gacha-bankr-skill
+@bankrbot install the skill at https://github.com/panikadak/stonk-gacha-bankr-skill and pull me a $10 Stonk Gacha
 ```
 
-Then ask Bankr to use `stonk-gacha`, or make a matching request such as “show my
-Stonk Gacha requests.” Reinstalling the same URL updates an existing install.
+If it is already installed, `@bankrbot pull me a $10 Stonk Gacha` is enough.
+Reinstalling the same URL updates an existing install.
 See Bankr's official [GitHub skill installation
 guide](https://docs.bankr.bot/skills/in-bankr/from-github/) and [skill format
 reference](https://docs.bankr.bot/skills/in-bankr/skill-format/).
@@ -41,11 +42,12 @@ reference](https://docs.bankr.bot/skills/in-bankr/skill-format/).
   The named `$10` is bound to the deployed pack price, approval/open replay is
   blocked by a short-lived request-count intent, and claim authority is bound to
   that exact `PackOpened` receipt. The intermediate approval, open, Pending
-  state, quote, and claim stay silent.
+  state, recovery, quote, and claim stay silent.
 - A USDC-short open reports the exact deficit and asks the user to choose Base
   ETH or WETH. It never auto-selects a token or lowers the pack.
-- After source choice, one bounded confirmation can cover the listed Bankr
-  swap leg(s), conditional allowance reset, exact USDC approval, and one open.
+- After source choice, one bounded confirmation covers the listed Bankr swap
+  leg(s), conditional allowance reset, exact USDC approval, one open, and the
+  default same-wallet claim of only that resulting request.
   Fresh post-swap reads invalidate that authority if the price, offer hash,
   ceiling, fee cap, or wallet request-count baseline no longer matches.
 - X approvals bind the direct parent tweet, numeric X identity, linked wallet,
@@ -57,7 +59,9 @@ reference](https://docs.bankr.bot/skills/in-bankr/skill-format/).
 Read [SKILL.md](SKILL.md) for the agent workflow,
 [references/operations.md](references/operations.md) for protocol behavior, and
 [references/bankr-execution.md](references/bankr-execution.md) for execution and
-receipt rules. X runtimes must also follow
+receipt rules. Pull runtimes must follow
+[references/runtime-journal.md](references/runtime-journal.md) for private
+resume state. X runtimes must also follow
 [references/x-confirmation.md](references/x-confirmation.md).
 
 ## Direct pull
@@ -65,15 +69,18 @@ receipt rules. X runtimes must also follow
 When the active wallet already holds enough canonical Base USDC and native ETH,
 an explicit request such as `pull me a $10` runs without a second conversational
 confirmation. Bankr submits any exact approval phase, opens one matching pack,
-waits for the request to become Ready, delivers the prize to the same wallet
-using the default nonzero output floor, and replies only after proof:
+waits or privately resumes until the exact request becomes Ready, delivers the
+prize to the same wallet using a fresh nonzero output floor, and replies only
+after proof:
 
 ```text
 You pulled $20 of GOOGLc.
 ```
 
-Any funding trade, alternate recipient, custom slippage, changed terms, or
-ambiguous submission stops the silent lifecycle and requires a new user choice.
+Any funding trade, alternate recipient, custom slippage, or changed terms needs
+a new user choice. An ambiguous submission stays private for receipt/state
+reconciliation and is never blindly replayed or presented as the result. All
+intermediate state stays out of the direct-pull response.
 
 ## Funded pack open
 
@@ -87,8 +94,9 @@ node scripts/stonk-gacha.mjs plan-open-pack \
 ```
 
 If canonical Base USDC is short, it returns `choose-funding-source` with the
-exact deficit and separate Base ETH/WETH/native-fee state. Show those choices
-and wait for the user to name ETH or WETH. Then obtain a structured
+exact deficit and separate Base ETH/WETH/native-fee state. An initial command
+that explicitly names Base ETH or Base WETH supplies that choice; otherwise ask
+one short source question. Then obtain a structured
 [`/wallet/swap-quote`](https://docs.bankr.bot/wallet-api/swap/) sized only for
 the deficit from the authenticated Bankr runtime and pass the exact quote
 bounds into `plan-open-pack-funding`; never source them from user text, pasted
@@ -122,8 +130,9 @@ before any approval or open. Immediately before each funded approval/open,
 covering the live fee plus headroom. Before every swap, the runtime rechecks
 expiry, current linked wallet, and the exact next execution-journal step.
 If funding is complete but only pack economics changed, the planner can issue a
-new `do=approve+open` confirmation with no swap authority; the original funding
-legs are never replayed.
+new `do=approve+open+claim` confirmation with no swap authority; the original
+funding legs are never replayed. No separate claim confirmation follows either
+funded path.
 
 The consent model follows Bankr's published [Hunch funding
 pattern](https://github.com/BankrBot/skills/blob/main/hunch/SKILL.md#L340-L367),

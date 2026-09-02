@@ -3,6 +3,8 @@
 Read this reference before planning a write or interpreting a request. Values in
 CLI output are observations at a pinned canonical Base block; sales, reserve,
 offers, fees, request state, quotes, and processable profit can change.
+Direct-pull monitoring and recovery must also follow
+[runtime-journal.md](runtime-journal.md).
 
 ## Product model
 
@@ -120,18 +122,23 @@ nonzero stale allowance to zero, or approve exactly the current price. After the
 approval receipt, rerun `plan-open-pack`; do not reuse the old offer or action.
 If the wallet lacks USDC, report the exact deficit and stop at
 `choose-funding-source`. The output separates canonical Base USDC, native Base
-ETH, and Base WETH. Show eligible ETH and WETH balances and ask which one the
-user wants to spend. Never select a token or lower the pack automatically.
+ETH, and Base WETH. Honor an explicit Base ETH/WETH source in the current
+command; otherwise ask one short source question. Never select a token or lower
+the pack automatically.
 
 An explicit current command for one matching pack authorizes an ordinary
 `plan-open-pack` with sufficient USDC and native ETH. Run its reset/approval and
 open phases silently while fresh replans retain the exact unexpired direct
 intent/key and unchanged request baseline. After the verified open, take the
 request id and opaque claim continuation only from its `inspect-tx`
-`postStateProof`, then poll that request silently. When it becomes `Ready`, run
-`plan-claim-prize` with that exact continuation/key without another prompt. The
-combined funding authorization below exists only after an explicit source
-choice and does not silently authorize prize claim.
+`postStateProof`, immediately persist the complete exact-request runtime record,
+then run `await-claim-prize` with that exact continuation/key. Its integrated
+watcher remains silent, emits no transaction while `Pending`, and delegates to
+the guarded default claim planner only when a fresh read is `Ready`. A process
+timeout preserves the record for an exact resume; it does not require the user
+to reconstruct the request. The combined funding authorization below exists
+only after an explicit source choice and includes the same exact-request,
+same-wallet delivery, so it must not trigger a second claim prompt.
 
 Postcondition: a scoped `PackOpened` event, an exact canonical official-USDC
 transfer from the wallet to Gacha, and a fresh request in `Pending`. Do not
@@ -177,7 +184,8 @@ Base plan only after the arrival is mined and reconciled. If bridge/network cost
 is unavailable or unbounded, fail closed without presenting that confirmation.
 
 The emitted one bounded confirmation covers the exact ordered funding swap(s),
-conditional stale-allowance zero reset, exact pack-price approval, and one open.
+conditional stale-allowance zero reset, exact pack-price approval, one open,
+and the default same-wallet claim of only that resulting request.
 Persist the intent and execution journal, consume approval atomically once, and
 run each step sequentially. Do not prompt again between unchanged authorized
 steps, and do not use the authority for a different pack, source, bound, wallet,
@@ -197,8 +205,8 @@ the captured `requestCountOf(wallet)` baseline.
   while the local offer hash is valid, balances preserve the current pack plus
   native headroom, and request count is unchanged, the planner emits
   `remaining-open-reconfirmation`. Its new short-lived intent/key authorizes
-  only the remaining conditional approval and one open; it carries no swap
-  authority and no funding leg may replay.
+  only the remaining conditional approval, one open, and same-request
+  same-wallet claim; it carries no swap authority and no funding leg may replay.
 - A changed linked wallet, pack, expiry, request count, invalid local offer, or
   insufficient balance cannot use that remaining-open rebase and emits no
   transaction.
@@ -241,6 +249,34 @@ Plans `USDC.approve(StonkGacha,0)` when a nonzero allowance remains. Use it afte
 an abandoned or completed approval flow when allowance is still present.
 Postcondition: fresh allowance is zero.
 
+### `await-claim-prize`
+
+This is an authorized pull's integrated exact-request watcher and claim planner.
+Require the active wallet, request id, receipt-emitted continuation, and
+continuation key together. Optional `--max-wait-seconds` and
+`--poll-interval-seconds` must remain inside the command's bounded policy and
+leave the process comfortably below Bankr's 60-minute job cap.
+
+The command re-proves the exact historical `PackOpened` source, checks the
+continuation against the active wallet and request, and reads fresh canonical
+state on every poll. It never signs or broadcasts.
+
+- `Pending` at timeout emits no transaction and preserves the exact journal
+  record for a later invocation.
+- `Ready` obtains a fresh Treasury quote and emits at most one default
+  same-wallet claim transaction with the fixed 300 bps policy and a deadline no
+  more than 600 seconds from its pinned snapshot.
+- `Delivered` emits no transaction and cannot replay delivery. Recover and
+  inspect the exact claim receipt before any final response; request state alone
+  does not prove the delivery recipient.
+- `Expired` or `Refunded` emits no claim transaction and cannot reinterpret the
+  original pull as refund authority.
+
+The continuation grants silent delivery for at most 172800 seconds from the
+proven open receipt. The journal cannot renew it. Missing, malformed, stopped,
+or expired authority falls back to the standalone `plan-claim-prize` flow and
+its normal concise confirmation.
+
 ### `plan-claim-prize`
 
 Require a `Ready` request owned by the active wallet, nonzero `payoutUsdc`,
@@ -251,17 +287,20 @@ the user may explicitly choose another valid tolerance. Use a short fresh
 deadline. Default recipient to the active wallet; an alternate recipient must
 be explicit and reconfirmed.
 
-For the same request created by a current direct pull, the original command
+For the same request created by a current authorized pull, the original command
 also authorizes default-recipient delivery with the default 300 bps tolerance,
-but only through the short-lived claim continuation emitted after `inspect-tx`
-proves the exact source `PackOpened` receipt. The continuation binds the source
-transaction, source inspection context/key, direct intent key, wallet, exact
-request id, same-wallet recipient, and slippage policy. Both planning and
-`inspect-calldata` re-prove the historical Bankr execution and receipt. Do not
-ask again or surface the quote. Without that exact continuation, even a default
-same-wallet claim is a standalone write requiring its normal confirmation.
-Continuation authority is invalid for a different request, alternate
-recipient, custom tolerance, changed wallet, or expired continuation.
+but only through the bounded 172800-second claim continuation emitted after
+`inspect-tx` proves the exact source `PackOpened` receipt. The continuation
+binds the source transaction, source inspection context/key, direct or funded
+authorization key, wallet, exact request id, same-wallet recipient, and
+slippage policy. Both
+planning and `inspect-calldata` re-prove the historical Bankr execution and
+receipt. The claim transaction itself always uses a fresh deadline no more than
+600 seconds from its pinned planning snapshot. Do not ask again or surface the
+quote. Without that exact continuation, even a default same-wallet claim is a
+standalone write requiring its normal confirmation. Continuation authority is
+invalid for a different request, alternate recipient, custom tolerance,
+changed wallet, stopped record, or expired continuation.
 
 Any route, liquidity, router, token-transfer, quote, or floor failure reverts the
 whole call and leaves the request `Ready` for a fresh retry. Never lower a floor
@@ -326,9 +365,17 @@ transfer. A currently sub-minimum amount is not processable and stays in reserve
 - Raw `/wallet/submit` has no documented idempotency key. Reconcile ambiguous
   approval from allowance/activity and ambiguous `openPack` from
   `PackOpened`/request state/activity before any resend.
+- Before a direct claim submission, move the exact runtime record from
+  `awaiting-settlement` or `ready` to `claim-submitting`, retaining the exact
+  opaque inspection context/key for receipt recovery. Record a returned hash
+  before receipt polling. An unknown result stays in `needs-reconciliation`
+  and cannot be replayed; reconcile Bankr Activity, receipt evidence, and fresh
+  request state first.
 - Another-chain balances never satisfy Base gates, and a lower pack is never an
   automatic fallback.
 - If an expected event or postcondition is absent, report "submitted but
-  unverified" and stop before any dependent action.
+  unverified" and stop before any dependent action. In a direct pull, keep that
+  status private in its exact resume record and reconcile instead of surfacing
+  it as the pull result.
 - Bankr security controls are authoritative. Explain a rejection and stop; do
   not route around it with another wallet, endpoint, site, or contract.

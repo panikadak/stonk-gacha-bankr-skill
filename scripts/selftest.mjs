@@ -54,6 +54,9 @@ import {
   getStorageAt,
   getTransaction,
   getTransactionCount,
+  isRetryableRpcTransportError,
+  RpcError,
+  RpcTransportError,
 } from "./lib/chain.mjs";
 import { eventTopic, keccak256, selector } from "./lib/keccak256.mjs";
 import {
@@ -114,6 +117,7 @@ import {
   verifyDeployment,
   walletRequests,
 } from "./lib/protocol.mjs";
+import { watchExactRequest } from "./lib/watch.mjs";
 
 const LIVE = process.argv.includes("--live");
 const results = [];
@@ -518,7 +522,8 @@ rejects("direct pull intent cannot begin consumed", () => validateDirectPullInte
 const directClaimContinuation = createDirectClaimContinuation({
   wallet,
   requestId: 42n,
-  directPullIntentKey: directIntentKeyValue,
+  sourceAuthorizationKind: "direct-pull-intent",
+  sourceAuthorizationKey: directIntentKeyValue,
   openTransactionHash: keccak256("direct-open-transaction"),
   openInspectionKey: keccak256("direct-open-inspection"),
   openInspectionContextHex: "0x7b7d",
@@ -547,8 +552,11 @@ const changedRequestContinuation = structuredClone(directClaimContinuation);
 changedRequestContinuation.requestId = "43";
 check("direct claim key changes with request id", directClaimContinuationKey(changedRequestContinuation) !== directClaimKeyValue);
 const changedSourceContinuation = structuredClone(directClaimContinuation);
-changedSourceContinuation.sourceOpenProof.directPullIntentKey = keccak256("other-direct-intent");
+changedSourceContinuation.sourceOpenProof.authorizationKey = keccak256("other-direct-intent");
 check("direct claim key changes with source intent", directClaimContinuationKey(changedSourceContinuation) !== directClaimKeyValue);
+const wrongSourceKindContinuation = structuredClone(directClaimContinuation);
+wrongSourceKindContinuation.sourceOpenProof.authorizationKind = "arbitrary-request";
+rejects("direct claim continuation rejects unknown source authorization", () => validateDirectClaimContinuation(wrongSourceKindContinuation), "unsupported");
 const wrongRecipientContinuation = structuredClone(directClaimContinuation);
 wrongRecipientContinuation.deliveryPolicy.recipient = otherWallet;
 rejects("direct claim continuation rejects redirected recipient", () => validateDirectClaimContinuation(wrongRecipientContinuation), "active wallet");
@@ -568,6 +576,146 @@ const injectedClaimContinuation = structuredClone(directClaimContinuation);
 injectedClaimContinuation.unreviewed = true;
 rejects("direct claim continuation rejects injected fields", () => validateDirectClaimContinuation(injectedClaimContinuation), "unsupported field");
 
+// Exact-request watching is a pure read-only state machine. A fake monotonic
+// clock and injected request reader exercise every path without sleeping,
+// touching Base, producing calldata, signing, or submitting anything.
+function watchedRequest(status, overrides = {}) {
+  return {
+    requestId: "42",
+    buyer: wallet,
+    status,
+    snapshot: { timestamp: "1000" },
+    ...overrides,
+  };
+}
+
+function fakeWatchClock() {
+  let milliseconds = 0;
+  return {
+    now: () => milliseconds,
+    sleep: async (delay) => { milliseconds += delay; },
+    value: () => milliseconds,
+  };
+}
+
+async function runWatch(sequence, overrides = {}) {
+  const clock = overrides.clock ?? fakeWatchClock();
+  const observations = [...sequence];
+  const requestedIds = [];
+  let last = observations.at(-1);
+  const outcome = await watchExactRequest({
+    wallet,
+    requestId: 42n,
+    continuationExpiresAt: 2_000n,
+    timeoutMs: 1_000,
+    pollIntervalMs: 100,
+    maxConsecutiveTransportErrors: 2,
+    monotonicNow: clock.now,
+    sleep: clock.sleep,
+    isRetryableTransportError: isRetryableRpcTransportError,
+    readRequest: async (requestId) => {
+      requestedIds.push(requestId);
+      const next = observations.length > 0 ? observations.shift() : last;
+      if (next instanceof Error) throw next;
+      last = next;
+      return next;
+    },
+    ...overrides.options,
+  });
+  return { outcome, requestedIds, clock };
+}
+
+const pendingReadyWatch = await runWatch([
+  watchedRequest("Pending"),
+  watchedRequest("Pending", { snapshot: { timestamp: "1001" } }),
+  watchedRequest("Ready", { snapshot: { timestamp: "1002" } }),
+]);
+equal("exact watch observes Pending to Ready", pendingReadyWatch.outcome.outcome, "ready");
+equal("exact watch Ready attempt count", pendingReadyWatch.outcome.attempts, 3);
+equal("exact watch Ready successful observation count", pendingReadyWatch.outcome.observations, 3);
+deepEqual("exact watch never changes request id", pendingReadyWatch.requestedIds, [42n, 42n, 42n]);
+equal("exact watch fake elapsed time", pendingReadyWatch.outcome.elapsedMs, 200);
+check("exact watch never emits transactions", !Object.hasOwn(pendingReadyWatch.outcome, "txs"));
+
+const deliveredWatch = await runWatch([watchedRequest("Delivered")]);
+equal("exact watch classifies Delivered", deliveredWatch.outcome.outcome, "delivered");
+equal("Delivered watch does not sleep", deliveredWatch.clock.value(), 0);
+check("Delivered watch never emits transactions", !Object.hasOwn(deliveredWatch.outcome, "txs"));
+
+const expiredWatch = await runWatch([watchedRequest("Expired")]);
+equal("exact watch classifies Expired", expiredWatch.outcome.outcome, "expired");
+const refundedWatch = await runWatch([watchedRequest("Refunded")]);
+equal("exact watch classifies Refunded", refundedWatch.outcome.outcome, "refunded");
+const noneWatch = await runWatch([{ status: "None" }]);
+equal("exact watch classifies None", noneWatch.outcome.outcome, "none");
+
+const timeoutClock = fakeWatchClock();
+const timeoutWatch = await runWatch([watchedRequest("Pending")], {
+  clock: timeoutClock,
+  options: { timeoutMs: 250, pollIntervalMs: 100 },
+});
+equal("exact watch classifies bounded Pending timeout", timeoutWatch.outcome.outcome, "pending-timeout");
+equal("exact watch timeout is monotonic and exact", timeoutWatch.outcome.elapsedMs, 250);
+equal("exact watch timeout does not poll after deadline", timeoutWatch.outcome.attempts, 3);
+equal("exact watch timeout retry delay", timeoutWatch.outcome.retryAfterMs, 100);
+check("Pending timeout never emits transactions", !Object.hasOwn(timeoutWatch.outcome, "txs"));
+
+const continuationExpiredWatch = await runWatch([
+  watchedRequest("Pending", { snapshot: { timestamp: "2000" } }),
+]);
+equal("exact watch stops when continuation expires", continuationExpiredWatch.outcome.outcome, "continuation-expired");
+equal("expired continuation preserves observed Pending state", continuationExpiredWatch.outcome.status, "Pending");
+equal("expired continuation does not sleep", continuationExpiredWatch.clock.value(), 0);
+const readyAfterExpiryWatch = await runWatch([
+  watchedRequest("Ready", { snapshot: { timestamp: "2000" } }),
+]);
+equal("exact watch never plans Ready after continuation expiry", readyAfterExpiryWatch.outcome.outcome, "continuation-expired");
+
+const transientOne = new RpcTransportError("all configured Base RPCs failed", { retryable: true });
+const transientTwo = new RpcTransportError("the configured Base RPC failed", { retryable: true });
+const recoveredTransportWatch = await runWatch([
+  transientOne,
+  transientTwo,
+  watchedRequest("Pending"),
+  watchedRequest("Ready", { snapshot: { timestamp: "1001" } }),
+]);
+equal("exact watch recovers tagged transport failures", recoveredTransportWatch.outcome.outcome, "ready");
+equal("exact watch counts tagged transport failures", recoveredTransportWatch.outcome.transportErrors, 2);
+equal("exact watch resets consecutive errors after a read", recoveredTransportWatch.outcome.consecutiveTransportErrors, 0);
+equal("exact watch exponentially backs off transient transport failures", recoveredTransportWatch.clock.value(), 400);
+
+await rejectsAsync("exact watch rejects exhausted transport errors", async () => {
+  await runWatch([
+    new RpcTransportError("transport one", { retryable: true }),
+    new RpcTransportError("transport two", { retryable: true }),
+    new RpcTransportError("transport three", { retryable: true }),
+  ]);
+}, "exhausted its transport error allowance");
+
+await rejectsAsync("exact watch does not retry untagged errors", async () => {
+  await runWatch([new Error("malformed request proof")]);
+}, "malformed request proof");
+
+await rejectsAsync("exact watch does not retry semantic RPC errors", async () => {
+  await runWatch([new RpcError("RPC -32603: execution reverted", "0xdeadbeef", -32603)]);
+}, "execution reverted");
+
+await rejectsAsync("exact watch rejects a different observed request", async () => {
+  await runWatch([watchedRequest("Ready", { requestId: "43" })]);
+}, "different request id");
+
+await rejectsAsync("exact watch rejects a different request buyer", async () => {
+  await runWatch([watchedRequest("Ready", { buyer: otherWallet })]);
+}, "buyer differs");
+
+await rejectsAsync("exact watch rejects unknown request status", async () => {
+  await runWatch([watchedRequest("Cancelled")]);
+}, "unsupported request status");
+
+check("only explicitly tagged transport exhaustion is retryable", isRetryableRpcTransportError(transientOne));
+check("untagged errors are not retryable transport exhaustion", !isRetryableRpcTransportError(new Error("fetch failed")));
+check("semantic RpcError is not retryable transport exhaustion", !isRetryableRpcTransportError(new RpcError("RPC error")));
+
 // The CLI's randomness boundary is intentionally tested as source evidence,
 // because the command is a process entrypoint rather than an importable module.
 const plannerSource = readFileSync(new URL("./stonk-gacha.mjs", import.meta.url), "utf8");
@@ -585,6 +733,7 @@ check("normal direct pack reads replay baseline", normalOpenPlannerSource.includ
 check("normal direct pack preserves canonical intent across approval replan", normalOpenPlannerSource.includes("--direct-intent ${directIntentHex}") && normalOpenPlannerSource.includes("--direct-intent-key ${directIntentKeyValue}"));
 check("normal direct pack does not resume from bare supplied randomness", !normalOpenPlannerSource.includes("--user-random"));
 check("verified open continues silently to the exact request claim", normalOpenPlannerSource.includes("continuation: silentPullContinuation(wallet)"));
+check("successful open advances to receipt-bound await instead of replay planning", plannerSource.includes("On success, inspect the receipt, persist its exact PackOpened request continuation, and immediately run its await command") && !plannerSource.includes("then rerun the emitted resume command"));
 const claimPrizePlannerSource = plannerSource.slice(
   plannerSource.indexOf("async function planClaimPrize()"),
   plannerSource.indexOf("async function planExpireRequest()"),
@@ -598,7 +747,21 @@ check("direct pull continuation is built from proven PackOpened request", planne
 check("direct claim source proves Bankr execution and exact PackOpened request", plannerSource.includes("async function proveDirectClaimSource") && plannerSource.includes("bound PackOpened receipt request id differs from the claim continuation"));
 check("direct claim source requires hidden preimage and receipt-anchored windows", plannerSource.includes("decodeDirectPullIntent(inspection.context.terms.directPullIntent)") && plannerSource.includes("bound open receipt mined outside its direct intent validity window") && plannerSource.includes("claim continuation window is not anchored exactly to the bound open receipt"));
 check("claim inspector rechecks canonical continuation", plannerSource.includes("decodeDirectClaimContinuation(terms.directClaimContinuation)") && plannerSource.includes("direct claim continuation failed the fresh pre-signing gate"));
-check("direct pull continuation has a bounded silent wait", plannerSource.includes("maximumSilentWaitSeconds: BANKR_EXECUTION.directPull.maximumSilentWaitSeconds"));
+const awaitClaimPlannerSource = plannerSource.slice(
+  plannerSource.indexOf("async function awaitClaimPrize()"),
+  plannerSource.indexOf("async function planExpireRequest()"),
+);
+check("integrated await command is routed", plannerSource.includes('case "await-claim-prize": return await awaitClaimPrize()'));
+check("integrated await command watches only the exact request", awaitClaimPlannerSource.includes("watchExactRequest({") && awaitClaimPlannerSource.includes("requestId,"));
+check("integrated await command reuses receipt-bound claim authorization", awaitClaimPlannerSource.includes("await proveDirectClaimSource(continuation)") && awaitClaimPlannerSource.includes("return await planClaimPrize()"));
+check("integrated await command never builds a claim while Pending", awaitClaimPlannerSource.includes('outcome.outcome === "ready"') && awaitClaimPlannerSource.includes('outcome.outcome === "pending-timeout"'));
+check("integrated await command keeps Pending progress private", awaitClaimPlannerSource.includes('mode: "silent-continue"') && awaitClaimPlannerSource.includes("Do not post progress"));
+check("integrated await command returns only the verified delivery sentence", plannerSource.includes('rule: "Reply with finalMessage verbatim and nothing else."'));
+check("Delivered state alone cannot produce the final pull sentence", awaitClaimPlannerSource.includes('phase: "delivered-needs-receipt-proof"') && awaitClaimPlannerSource.includes("Do not post a result from request state alone") && !plannerSource.includes("deliveredPullResult"));
+check("verified open emits exact await command and private resume record", plannerSource.includes("awaitCommand") && plannerSource.includes('action: "upsert-before-await"') && plannerSource.includes("directPullJournalPath"));
+check("open receipt inspection exposes the exact await as top-level next", plannerSource.includes("next: postStateProof.awaitCommand") && plannerSource.includes("Persist runtimeJournal, then run next immediately"));
+check("claim journal transition accepts watcher-ready prior state", plannerSource.includes('expectedPriorStages: ["awaiting-settlement", "ready"]'));
+check("claim journal preserves opaque receipt-inspection proof before submit", plannerSource.includes("claimInspectionContextHex: inspection.hex") && plannerSource.includes("claimInspectionKey: planInspectionKey") && plannerSource.includes("mark-needs-reconciliation-preserve-claim-proof"));
 check("successful delivery proof returns concise Gacha result fields", plannerSource.includes("payoutUsdcFormatted") && plannerSource.includes("recordedStockOutFormatted") && plannerSource.includes('finalTemplate: "You pulled $X of SYMBOL."'));
 check("offer reads do not expose RTP telemetry", !protocolSource.includes("nominalRtpBps") && !protocolSource.includes("effectiveRtpBps(uint256)"));
 check("successful deployment verification emits only a summary", plannerSource.includes("deploymentIntegrity: true") && plannerSource.includes("verifiedChecks: result.checks.length") && !plannerSource.includes("out({ ok: result.ok, command, wallet, ...result }"));
@@ -607,8 +770,15 @@ const fundedResumePlannerSource = plannerSource.slice(
   plannerSource.indexOf("function bindXIntent()"),
 );
 check("funded resume defines its stage-specific preflight before use", fundedResumePlannerSource.indexOf("const resumePreflight") > 0 && fundedResumePlannerSource.indexOf("const resumePreflight") < fundedResumePlannerSource.indexOf("fundingBaselineRequestCount"));
-check("funded authorization does not silently widen into prize claim", !fundedResumePlannerSource.includes("continuation: silentPullContinuation"));
-check("planner rejects supplied zero randomness", plannerSource.includes("--user-random cannot be zero"));
+check("funded calldata inspection binds expiry replay baseline headroom and approval to the signed intent", [
+  "funded-open intent expiry",
+  "funded-open request-count baseline",
+  "funded-open native headroom",
+  "funded-open approval token",
+  "funded-open approval spender",
+  "funded-open approval amount",
+].every((label) => plannerSource.includes(label)));
+check("planner never accepts a caller-supplied claim capability", !plannerSource.includes('"user-random"') && !plannerSource.includes("--user-random"));
 check("calldata inspector rejects zero randomness", plannerSource.includes("user randomness cannot be zero"));
 check("generated randomness loops until nonzero", /do value = .*randomBytes\(32\).*while \(\/\^0x0\{64\}\$\//s.test(plannerSource));
 check("every open inspection requires exactly one authorization mode", plannerSource.includes("open-pack requires a bound funded or direct one-time intent") && plannerSource.includes("cannot combine funded and direct authorization modes"));
@@ -636,6 +806,7 @@ check("zero is outside valid buyer-random domain", !/^0x0{64}$/.test(userRandom)
 const fundingFixture = FUNDING_FIXTURES.baseWethWithNativeTopUp;
 const fundingCreatedAt = 1_788_345_000n;
 const fundingExpiresAt = fundingCreatedAt + 600n;
+const fundingClaimCapabilitySecret = `0x${"27".repeat(32)}`;
 const baseWethFundingParams = {
   wallet,
   packIndex: fundingFixture.packIndex,
@@ -663,7 +834,7 @@ const baseWethFundingParams = {
   nativeSwapSlippageBps: fundingFixture.nativeQuote.slippageBps,
   nativeQuoteId: fundingFixture.nativeQuote.quoteId,
   nativeSwapIdempotencyKey: fundingFixture.nativeSwapIdempotencyKey,
-  userRandomNumber: userRandom,
+  claimCapabilitySecret: fundingClaimCapabilitySecret,
   createdAt: fundingCreatedAt,
   expiresAt: fundingExpiresAt,
 };
@@ -676,6 +847,7 @@ equal("funding policy canonical WETH", normalizeAddress(FUNDING_POLICY.canonical
 equal("funding policy native sentinel", NATIVE_SENTINEL, "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 equal("funding policy native headroom", DEFAULT_NATIVE_HEADROOM_WEI, 1_500_000_000_000_000n);
 check("funding policy forbids automatic source", !FUNDING_POLICY.combinedOpen.allowAutomaticSourceSelection);
+check("an explicitly named Base funding source is not asked twice", plannerSource.includes('sourceSelectionRequired: "only-if-current-command-did-not-explicitly-name-base-eth-or-base-weth"') && plannerSource.includes("use only that source without asking again"));
 check("funding policy forbids automatic pack downgrade", !FUNDING_POLICY.combinedOpen.allowAutomaticPackDowngrade);
 check("funding policy forbids swap calldata and vague prompts", !FUNDING_POLICY.combinedOpen.allowSwapCalldata && !FUNDING_POLICY.combinedOpen.allowNaturalLanguageSwapPrompt);
 check("cross-chain never counts as Base balance", !FUNDING_POLICY.crossChain.countsAsBaseBalance && FUNDING_POLICY.crossChain.requiresSeparateConfirmation);
@@ -694,8 +866,18 @@ check("zero native ETH makes ETH ineligible", !sourceOptions.choices[0].eligible
 check("WETH remains separate from native msg.value", sourceOptions.choices[1].eligible && sourceOptions.choices[1].nativeTopUpRequired);
 equal("WETH native top-up covers fee plus headroom", sourceOptions.choices[1].minimumNativeTopUpWei, "1600000000000000");
 
-equal("WETH funding intent kind", wethFundingIntent.kind, "stonk-gacha-funded-open/v1");
+equal("WETH funding intent kind", wethFundingIntent.kind, "stonk-gacha-funded-open/v2");
 equal("WETH funding exact deficit", wethFundingIntent.preflight.exactDeficitUsdcRaw, "8000000");
+equal("funding intent retains its hidden claim capability", wethFundingIntent.pack.claimCapabilitySecret, fundingClaimCapabilitySecret);
+equal("funding intent derives its Pyth contribution from the claim capability", wethFundingIntent.pack.userRandomNumber, directUserRandomNumber(fundingClaimCapabilitySecret));
+check("funding claim capability and committed Pyth contribution are distinct", wethFundingIntent.pack.userRandomNumber !== fundingClaimCapabilitySecret);
+deepEqual("funding intent pins default same-wallet delivery", wethFundingIntent.deliveryPolicy, { recipient: wallet, slippageBps: DIRECT_CLAIM_SLIPPAGE_BPS });
+deepEqual("funding intent authorizes only bounded open and same-request delivery actions", wethFundingIntent.allowedActions, [
+  "conditional-allowance-reset",
+  "exact-usdc-approval",
+  "open-pack",
+  "same-request-claim-prize",
+]);
 deepEqual("WETH zero-native flow has ordered two legs", wethFundingIntent.fundingLegs.map((entry) => entry.purpose), ["native-top-up", "usdc-deficit"]);
 equal("WETH aggregate maximum includes both legs", wethFundingIntent.source.aggregateMaximumInputRaw, "6000000000000000");
 equal("USDC leg targets canonical Base USDC", wethFundingIntent.fundingLegs[1].toToken, ADDR.usdc);
@@ -709,6 +891,22 @@ check("funding intent contains no route or calldata", !/(calldata|route)/i.test(
 const encodedWethIntent = encodeFundingIntent(wethFundingIntent);
 deepEqual("funding intent canonical hex round trip", decodeFundingIntent(encodedWethIntent), wethFundingIntent);
 equal("funding intent key survives round trip", fundingIntentKey(decodeFundingIntent(encodedWethIntent)), fundingIntentKey(wethFundingIntent));
+rejects("funding intent rejects a zero claim capability", () => makeWethFundingIntent({ claimCapabilitySecret: `0x${"0".repeat(64)}` }), "cannot be zero");
+const changedFundingCapability = structuredClone(wethFundingIntent);
+changedFundingCapability.pack.claimCapabilitySecret = `0x${"28".repeat(32)}`;
+rejects("funding intent rejects a capability not committed by its Pyth contribution", () => fundingIntentKey(changedFundingCapability), "not committed");
+const changedFundingRandomness = structuredClone(wethFundingIntent);
+changedFundingRandomness.pack.userRandomNumber = directUserRandomNumber(`0x${"28".repeat(32)}`);
+rejects("funding intent rejects randomness derived from another capability", () => fundingIntentKey(changedFundingRandomness), "not committed");
+const redirectedFundingDelivery = structuredClone(wethFundingIntent);
+redirectedFundingDelivery.deliveryPolicy.recipient = otherWallet;
+rejects("funding intent rejects redirected prize delivery", () => fundingIntentKey(redirectedFundingDelivery), "active wallet");
+const relaxedFundingDelivery = structuredClone(wethFundingIntent);
+relaxedFundingDelivery.deliveryPolicy.slippageBps = DIRECT_CLAIM_SLIPPAGE_BPS + 1;
+rejects("funding intent rejects changed prize slippage", () => fundingIntentKey(relaxedFundingDelivery), "differs from policy");
+const widenedFundingActions = structuredClone(wethFundingIntent);
+widenedFundingActions.allowedActions.push("other-request-claim-prize");
+rejects("funding intent rejects widened prize authority", () => fundingIntentKey(widenedFundingActions), "unsupported action set");
 rejects("funding floor below exact deficit", () => makeWethFundingIntent({ minUsdcOutRaw: 7_999_999n }), "must equal the exact required deficit");
 rejects("funding floor above exact deficit", () => makeWethFundingIntent({ minUsdcOutRaw: 8_000_001n }), "must equal the exact required deficit");
 rejects("oversized USDC quote is rejected", () => makeWethFundingIntent({ quotedUsdcOutRaw: 8_247_424n }), "quote is oversized");
@@ -760,6 +958,7 @@ check("intent key changes with offer hash", fundingIntentKey(makeEthFundingInten
 check("intent key changes with ceiling", fundingIntentKey(makeEthFundingIntent({ acceptedCeilingBps: 50_000n })) !== baseEthKey);
 check("intent key changes with fee cap", fundingIntentKey(makeEthFundingIntent({ entropyFeeWei: 100_000_000_000_001n })) !== baseEthKey);
 check("intent key changes with expiry", fundingIntentKey(makeEthFundingIntent({ expiresAt: fundingExpiresAt + 1n })) !== baseEthKey);
+check("intent key changes with claim capability", fundingIntentKey(makeEthFundingIntent({ claimCapabilitySecret: `0x${"28".repeat(32)}` })) !== baseEthKey);
 check("intent key changes with pack", fundingIntentKey(makeEthFundingIntent({
   packIndex: 2,
   packPriceUsdc: 20_000_000n,
@@ -808,9 +1007,13 @@ const remainingOpenIntent = rebaseFundingIntentForRemainingOpen(ethFundingIntent
   expiresAt: fundingCreatedAt + 701n,
 });
 equal("remaining-open reconfirmation has an explicit stage", remainingOpenIntent.stage, "remaining-open");
+equal("remaining-open preserves the hidden claim capability", remainingOpenIntent.pack.claimCapabilitySecret, ethFundingIntent.pack.claimCapabilitySecret);
+equal("remaining-open preserves the committed Pyth contribution", remainingOpenIntent.pack.userRandomNumber, ethFundingIntent.pack.userRandomNumber);
+deepEqual("remaining-open preserves same-wallet delivery", remainingOpenIntent.deliveryPolicy, ethFundingIntent.deliveryPolicy);
+check("remaining-open preserves exact same-request claim authority", remainingOpenIntent.allowedActions.includes("same-request-claim-prize"));
 check("remaining-open reconfirmation gets a new economic key", fundingIntentKey(remainingOpenIntent) !== baseEthKey);
 check("remaining-open intent carries no executable funding authority", !Object.hasOwn(remainingOpenIntent, "fundingLegs") && !Object.hasOwn(remainingOpenIntent, "source") && !Object.hasOwn(remainingOpenIntent, "minimumBaseUsdcOutputRaw") && !/(\/wallet\/swap|idempotencyKey|"bankr":)/i.test(JSON.stringify(remainingOpenIntent)));
-check("remaining-open X confirmation authorizes no swap replay", xPreparedConfirmation(remainingOpenIntent).includes("do=approve+open") && !xPreparedConfirmation(remainingOpenIntent).includes("do=swap+approve+open"));
+check("remaining-open X confirmation authorizes claim but no swap replay", xPreparedConfirmation(remainingOpenIntent).includes("do=approve+open+claim") && !xPreparedConfirmation(remainingOpenIntent).includes("do=swap+approve+open+claim"));
 deepEqual("remaining-open intent canonical hex round trip", decodeFundingIntent(encodeFundingIntent(remainingOpenIntent)), remainingOpenIntent);
 check("fresh remaining-open terms can resume after reconfirmation", fundingResumeAssessment(remainingOpenIntent, {
   ...liveFundingState,
@@ -873,7 +1076,8 @@ const xApprovalArgs = {
 };
 check("prepared X confirmation fits one tweet", xPreparedConfirmation(wethFundingIntent).length <= 280);
 check("self-contained X fallback fits one tweet", xSelfContainedCommand(wethFundingIntent).length <= 280);
-check("X confirmation encodes the complete action and compact units", ["do=swap+approve+open", "s=B/W", "m=0.006W", "u=8U", "f=0.0001E"].every((term) => xPreparedConfirmation(wethFundingIntent).includes(term)));
+check("X confirmation encodes funding through same-request claim and compact units", ["do=swap+approve+open+claim", "s=B/W", "m=0.006W", "u=8U", "f=0.0001E"].every((term) => xPreparedConfirmation(wethFundingIntent).includes(term)));
+check("X confirmation and fallback never expose the claim capability", !xPreparedConfirmation(wethFundingIntent).includes(fundingClaimCapabilitySecret.slice(2)) && !xSelfContainedCommand(wethFundingIntent).includes(fundingClaimCapabilitySecret.slice(2)));
 const longDecimalFundingIntent = makeWethFundingIntent({
   usdcBalance: 2_000_001n,
   ethBalance: 123n,
@@ -1198,9 +1402,15 @@ equal("Bankr live fixture count", BANKR_EXECUTION.sponsored.liveRegressionFixtur
 equal("Bankr direct live fixture count", BANKR_EXECUTION.direct.liveRegressionFixtures.length, 1);
 equal("direct pull Entropy fee cap", BigInt(BANKR_EXECUTION.directPull.maximumEntropyFeeWei), 10_000_000_000_000n);
 equal("direct pull claim slippage", BANKR_EXECUTION.directPull.claimSlippageBps, 300);
-equal("direct pull silent wait", BANKR_EXECUTION.directPull.maximumSilentWaitSeconds, 600);
+equal("direct pull poll interval", BANKR_EXECUTION.directPull.pollIntervalSeconds, 2);
+equal("direct pull active watch", BANKR_EXECUTION.directPull.activeWatchSeconds, 300);
+equal("direct pull maximum active watch", BANKR_EXECUTION.directPull.maximumActiveWatchSeconds, 3300);
+equal("direct pull transport error cap", BANKR_EXECUTION.directPull.maximumConsecutiveTransportErrors, 8);
+equal("direct pull transport backoff cap", BANKR_EXECUTION.directPull.maximumTransportBackoffSeconds, 30);
+equal("direct pull runtime journal root", BANKR_EXECUTION.directPull.runtimeJournalRoot, "/stonk-gacha/pulls");
 equal("direct pull intent TTL", BANKR_EXECUTION.directPull.intentTtlSeconds, 600);
-equal("direct claim continuation TTL", BANKR_EXECUTION.directPull.claimContinuationTtlSeconds, 600);
+equal("direct claim continuation TTL", BANKR_EXECUTION.directPull.claimContinuationTtlSeconds, 172800);
+equal("direct claim continuation spans resolve plus delivery grace", BANKR_EXECUTION.directPull.claimContinuationTtlSeconds, DEPLOYMENT.productTerms.resolveWindowSeconds * 2);
 check("direct pull policy binds price, request baseline, source receipt, and hidden capability", BANKR_EXECUTION.directPull.requireExactAuthorizedPrice && BANKR_EXECUTION.directPull.requireUnchangedRequestCountBeforeOpen && BANKR_EXECUTION.directPull.claimSource === "exact-proven-PackOpened-receipt-only" && BANKR_EXECUTION.directPull.claimCapability.includes("secret-preimage"));
 check("normal direct open enforces reviewed Entropy fee cap", normalOpenPlannerSource.includes("entropyFee <= entropyFeeCap") && plannerSource.includes("exact Entropy fee exceeds the direct pull authorization cap"));
 equal("acquisition stays structured Bankr-native", BANKR_EXECUTION.acquisition.mode, "structured-bankr-wallet-api");
@@ -1220,20 +1430,21 @@ const frontmatter = skillMarkdown.match(/^---\n([\s\S]*?)\n---(?:\n|$)/)?.[1] ??
 equal("Bankr skill name", frontmatter.match(/^name:\s*(.+)$/m)?.[1]?.trim(), "stonk-gacha");
 check("Bankr skill description exists", /^description:\s*\S.+$/m.test(frontmatter));
 check("Bankr top-level tags exist", /^tags:\s*\[[^\]]+\]$/m.test(frontmatter));
-equal("Bankr top-level version", Number(frontmatter.match(/^version:\s*(\d+)$/m)?.[1]), 4);
+equal("Bankr top-level version", Number(frontmatter.match(/^version:\s*(\d+)$/m)?.[1]), 5);
 equal("Bankr top-level visibility", frontmatter.match(/^visibility:\s*(\S+)$/m)?.[1], "public");
 equal("catalog slug", catalog.slug, "stonk-gacha");
 equal("catalog schema", catalog.schemaVersion, 1);
 equal("catalog repo path", catalog.install.repoPath, ".");
 check("catalog points at public source", catalog.install.command.includes("github.com/panikadak/stonk-gacha-bankr-skill"));
-check("catalog demonstrates one-command delivered Gacha pull", catalog.demo.code.includes("Pull me a $10") && catalog.demo.code.includes("You pulled $20 of GOOGLc.") && !catalog.demo.code.toLowerCase().includes("purchase"));
-check("skill requires silent open-to-delivery lifecycle", skillMarkdown.includes("Keep the entire workflow silent until completion") && skillMarkdown.includes("plan-claim-prize"));
+const catalogDemoTweet = catalog.demo.code.split("\n")[0].replace(/^You:\s*/, "");
+check("catalog demonstrates one-tweet install-to-delivery Gacha pull", catalogDemoTweet.startsWith("@bankrbot install the skill at https://github.com/panikadak/stonk-gacha-bankr-skill") && catalogDemoTweet.toLowerCase().includes("pull me a $10") && [...catalogDemoTweet].length <= 280 && catalog.demo.code.includes("You pulled $20 of GOOGLc.") && !catalog.demo.code.toLowerCase().includes("purchase"));
+check("skill requires silent open-to-delivery lifecycle", skillMarkdown.includes("Keep the entire workflow silent until completion") && skillMarkdown.includes("await-claim-prize") && skillMarkdown.includes("exact claim receipt"));
 
 for (const relative of [
   "SKILL.md", "references/operations.md", "references/bankr-execution.md",
   "references/deployment.json", "references/signing-allowlist.json", "references/bankr-execution.json",
   "references/funding-policy.json", "references/funding-fixtures.json", "references/x-confirmation.md",
-  "scripts/lib/direct.mjs",
+  "scripts/lib/direct.mjs", "scripts/lib/watch.mjs",
 ]) {
   try {
     const bytes = statSync(new URL(`../${relative}`, import.meta.url)).size;

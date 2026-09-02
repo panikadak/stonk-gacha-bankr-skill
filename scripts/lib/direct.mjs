@@ -10,7 +10,7 @@ const DEPLOYMENT_POLICY = JSON.parse(
 );
 
 export const DIRECT_PULL_KIND = "stonk-gacha-direct-pull/v1";
-export const DIRECT_CLAIM_KIND = "stonk-gacha-direct-claim/v1";
+export const DIRECT_CLAIM_KIND = "stonk-gacha-direct-claim/v2";
 export const DIRECT_PULL_TTL_SECONDS = BigInt(BANKR_POLICY.directPull.intentTtlSeconds);
 export const DIRECT_CLAIM_TTL_SECONDS = BigInt(BANKR_POLICY.directPull.claimContinuationTtlSeconds);
 export const DIRECT_CLAIM_SLIPPAGE_BPS = Number(BANKR_POLICY.directPull.claimSlippageBps);
@@ -290,7 +290,8 @@ export function assessDirectPullIntent(intentValue, fresh) {
 export function createDirectClaimContinuation({
   wallet,
   requestId,
-  directPullIntentKey: sourceIntentKey,
+  sourceAuthorizationKind,
+  sourceAuthorizationKey,
   openTransactionHash,
   openInspectionKey,
   openInspectionContextHex,
@@ -298,7 +299,7 @@ export function createDirectClaimContinuation({
   expiresAt,
 }) {
   return validateDirectClaimContinuation(jsonValue({
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: DIRECT_CLAIM_KIND,
     wallet: normalizeAddress(wallet),
     chainId: 8453,
@@ -306,7 +307,8 @@ export function createDirectClaimContinuation({
     createdAt: BigInt(createdAt),
     expiresAt: BigInt(expiresAt),
     sourceOpenProof: {
-      directPullIntentKey: String(sourceIntentKey).toLowerCase(),
+      authorizationKind: sourceAuthorizationKind,
+      authorizationKey: String(sourceAuthorizationKey).toLowerCase(),
       transactionHash: String(openTransactionHash).toLowerCase(),
       inspectionKey: String(openInspectionKey).toLowerCase(),
       inspectionContextHex: String(openInspectionContextHex).toLowerCase(),
@@ -323,7 +325,7 @@ export function validateDirectClaimContinuation(continuation) {
     "schemaVersion", "kind", "wallet", "chainId", "requestId", "createdAt", "expiresAt",
     "sourceOpenProof", "deliveryPolicy",
   ], "direct claim continuation");
-  invariant(continuation.schemaVersion === 1 && continuation.kind === DIRECT_CLAIM_KIND, "unsupported direct claim continuation schema");
+  invariant(continuation.schemaVersion === 2 && continuation.kind === DIRECT_CLAIM_KIND, "unsupported direct claim continuation schema");
   invariant(continuation.wallet === normalizeAddress(continuation.wallet), "direct claim wallet must be canonical lowercase");
   invariant(continuation.chainId === 8453, "direct claim continuation is not for Base");
   const requestId = canonicalUint(continuation.requestId, "direct claim request id");
@@ -333,9 +335,13 @@ export function validateDirectClaimContinuation(continuation) {
   invariant(expiry > created && expiry - created <= DIRECT_CLAIM_TTL_SECONDS, "direct claim continuation TTL is invalid");
 
   rejectUnknownKeys(continuation.sourceOpenProof, [
-    "directPullIntentKey", "transactionHash", "inspectionKey", "inspectionContextHex",
+    "authorizationKind", "authorizationKey", "transactionHash", "inspectionKey", "inspectionContextHex",
   ], "direct claim source proof");
-  canonicalBytes32(continuation.sourceOpenProof.directPullIntentKey, "direct claim source intent key");
+  invariant(
+    ["direct-pull-intent", "funded-open-intent"].includes(continuation.sourceOpenProof.authorizationKind),
+    "direct claim source authorization kind is unsupported",
+  );
+  canonicalBytes32(continuation.sourceOpenProof.authorizationKey, "direct claim source authorization key");
   canonicalBytes32(continuation.sourceOpenProof.transactionHash, "direct claim open transaction hash");
   canonicalBytes32(continuation.sourceOpenProof.inspectionKey, "direct claim open inspection key");
   canonicalOpaqueHex(continuation.sourceOpenProof.inspectionContextHex, "direct claim open inspection context");

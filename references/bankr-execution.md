@@ -24,21 +24,34 @@ receipt inspection to match it.
 From the installed skill directory:
 
 ```bash
-node scripts/selftest.mjs
-node scripts/selftest.mjs --live
 node scripts/stonk-gacha.mjs verify --wallet 0xActiveBankrEvmWallet
 ```
+
+Do not run the full self-test suite inside a user pull. Maintainers run it as a
+release check; each planner still repeats the live deployment gate.
 
 `STONK_GACHA_RPC_URL` takes precedence over `BASE_RPC_URL`. An explicit override
 is fail-closed; do not silently substitute remembered addresses, a frontend
 manifest, a broadcast file, explorer labels, or another RPC result after it
 fails. A deployment-pin change requires a reviewed skill update.
 
+## Reconcile unfinished pulls first
+
+At the start of every Stonk Gacha skill invocation, resolve the active wallet
+and reconcile its nonterminal records under `/stonk-gacha/pulls/8453/` before
+planning another write. Follow
+[runtime-journal.md](runtime-journal.md). Onchain request state is truth, an
+exact unexpired receipt-bound continuation is silent claim authority, and a
+journal record is only a private resume hint. This reconciliation stays out of
+the user-facing conversation.
+
 ## Plan and authorize
 
 Run the relevant `plan-*` command. Treat its stdout as one JSON document:
 
-- `ok: false` or nonzero process exit: relay the error and stop;
+- `ok: false` or nonzero process exit: submit nothing and follow the emitted
+  `presentation`; relay only a user-facing blocker, while direct-lifecycle
+  `silent-reconciliation` remains private;
 - empty `txs`: no transaction is ready;
 - one `txs` entry: one approval or action is ready for review;
 - approval phase: submit only that approval, prove it, then rerun the original
@@ -57,13 +70,17 @@ The opaque intent also holds a fresh claim-capability preimage whose
 domain-separated Keccak commitment is the open's onchain user-random input;
 never expose it conversationally or accept a replacement from public data.
 
-After the open receipt proves the new request, poll that request without posting
-progress. `inspect-tx` on the successful open emits a claim continuation bound
-to the exact Bankr execution, `PackOpened` request id, wallet, source intent,
-same-wallet recipient, and 300 bps policy. When that exact request becomes
-`Ready`, pass only that continuation and key to `plan-claim-prize`. The planner
-and calldata inspector re-prove the source receipt before silent submission.
-After delivery proof, return only `You pulled $X of SYMBOL.`
+After the open receipt proves the new request, `inspect-tx` emits a claim
+continuation bound to the exact Bankr execution, `PackOpened` request id,
+wallet, source intent, same-wallet recipient, and 300 bps policy. Immediately
+persist the complete request record described in `runtime-journal.md`, then run
+`await-claim-prize` with that exact request, continuation, and key. The
+pre-open intent remains bounded to 600 seconds. The receipt-bound delivery
+authorization is bounded to 172800 seconds so a Bankr process interruption does
+not erase the exact request's delivery authority; each emitted claim
+transaction still has a fresh 600-second deadline. The planner and calldata
+inspector re-prove the source receipt before silent submission. After delivery
+proof, return only `You pulled $X of SYMBOL.`
 
 For writes that are not already authorized by that direct lifecycle, present
 only the essential decision fields:
@@ -86,8 +103,9 @@ For a funded pack open, the planner's one bounded confirmation additionally
 names the explicitly chosen Base ETH/WETH source, aggregate maximum source
 spend, minimum canonical Base USDC output, any WETH-to-native top-up bounds,
 offer hash, accepted ceiling, native fee cap, expiry, and the conditional
-reset/exact-approval/open sequence. Do not split those known steps into repeated
-prompts, and do not reuse the confirmation for changed terms or another action.
+reset/exact-approval/open/exact-resulting-request-claim sequence. Do not split
+those known steps into repeated prompts, and do not reuse the confirmation for
+changed terms or another action.
 
 ## Inspect calldata
 
@@ -139,6 +157,44 @@ Use the runtime's protected authentication mechanism; never generate a command
 containing a real key. Submit one transaction at a time. Never parallelize an
 approval with its dependent action, and never replay a stale plan.
 
+Before an authorized silent claim submission, transition its exact runtime record from
+`awaiting-settlement` or `ready` to `claim-submitting` and retain the planner's
+opaque inspection context/key for receipt recovery. Record the returned
+transaction hash before receipt polling. A missing hash or unknown outcome
+requires state and Bankr Activity reconciliation; it is never permission to
+submit again. See `runtime-journal.md`.
+
+## Await one exact authorized claim
+
+After the open receipt is proven and journaled, use:
+
+```bash
+node scripts/stonk-gacha.mjs await-claim-prize \
+  --wallet 0xActiveBankrEvmWallet \
+  --request-id REQUEST_ID \
+  --claim-continuation 0xExactReceiptBoundContinuation \
+  --claim-continuation-key 0xExactContinuationKey \
+  --max-wait-seconds BOUNDED_WAIT \
+  --poll-interval-seconds BOUNDED_INTERVAL
+```
+
+The command is an integrated read-and-plan watcher. It never signs or
+broadcasts. It re-proves the exact source receipt and reads only the bound
+request. `Pending` at timeout emits no transaction and leaves the private
+record resumable. `Ready` emits at most one fresh default same-wallet claim
+plan. `Delivered`, `Expired`, or `Refunded` emits no claim transaction. A
+`Delivered` observation without the exact claim receipt stays private and
+requires receipt/recipient reconciliation before any final reply.
+
+The default active watch is five minutes, matching Bankr's production timeout
+guidance, and transport retries use bounded exponential backoff. Keep every
+active watcher comfortably below Bankr's
+[documented 60-minute agent job limit](https://docs.bankr.bot/faq/building-ai-agents/).
+A process timeout is not an authorization timeout: preserve and resume the
+private record in the same process when possible or at the next Stonk Gacha
+skill invocation. Do not expose watcher, continuation, or journal details to
+the user.
+
 ## Fund a USDC-short pack open
 
 Stonk Gacha pulls canonical Base USDC for the pack and forwards a separate exact
@@ -155,8 +211,10 @@ deficit, Base ETH balance, Base WETH balance, live Entropy fee, and required
 native reserve.
 
 Cross-check balances with Bankr's structured Base portfolio read. Match USDC and
-WETH by the canonical addresses in `funding-policy.json`, not by symbol. Show
-eligible Base ETH and WETH balances and ask the user which one to use. Never:
+WETH by the canonical addresses in `funding-policy.json`, not by symbol. If the
+current command explicitly names Base ETH or Base WETH, use only that named
+source. Otherwise show the eligible choices and ask one short source question.
+Never:
 
 - choose ETH, WETH, or any other token automatically;
 - count ETH/WETH on another chain as a Base balance;
@@ -221,7 +279,8 @@ only:
 2. a conditional zero reset of a mismatched nonzero USDC allowance;
 3. approval of exactly the current pack price; and
 4. one `openPack` using the confirmed pack, offer hash, ceiling, fee cap, and
-   fresh randomness.
+   fresh randomness; and
+5. the default same-wallet claim of only the request proven by that open.
 
 Persist the exact unexpired intent and execution journal, including the wallet's
 `requestCountOf(wallet)` baseline captured before funding. Atomically consume
@@ -257,10 +316,11 @@ If only price, offer hash, ceiling, or live fee changed after funding completed,
 the planner may emit `remaining-open-reconfirmation` only when the fresh local
 offer commitment is valid, canonical Base USDC covers the new price, native ETH
 still covers fee plus headroom, and request count is unchanged. Its new
-short-lived intent/key and X line use `do=approve+open`; they authorize only the
-conditional allowance work and one open. They carry no swap authority. Never
-silently replace a hash, accept a different ceiling, raise a fee cap, downgrade
-the pack, or replay a funding leg.
+short-lived intent/key and X line use `do=approve+open+claim`; they authorize
+only the conditional allowance work, one open, and that open's exact
+same-wallet claim. They carry no swap authority. Never silently replace a hash,
+accept a different ceiling, raise a fee cap, downgrade the pack, or replay a
+funding leg.
 
 A changed wallet, pack, expiry, request count, invalid local offer, short
 balance, or paused sale cannot use that remaining-open rebase and emits no
@@ -269,7 +329,8 @@ Any changed request count means a prior open may already have landed: stop,
 reconcile `PackOpened` and request state, and never replay the funded intent.
 
 The unchanged flow may proceed under the original consumed authorization: zero
-reset if needed, exact approval if needed, then one open, each sequentially.
+reset if needed, exact approval if needed, one open, then only its exact
+same-wallet claim when Ready, each sequentially.
 Immediately before signing each funded approval or open, run
 `inspect-calldata`. Its fresh gate rechecks intent expiry, request count, price,
 offer hash, ceiling, fee cap, and native ETH covering the live fee plus
@@ -366,10 +427,16 @@ dependent phase:
 A pending, unavailable, reverted, or ambiguous transaction is not permission to
 retry. Recover from its hash and fresh Base state. If receipt or postcondition
 proof remains incomplete, report "submitted but unverified," include the hash,
-and stop.
+and stop. For a direct pull, keep that state private in its resume record and
+continue reconciliation; do not replace the final pull result with this generic
+status.
 
 `/wallet/submit` has no documented idempotency field. For an ambiguous approval,
 reconcile Bankr Activity/nonce and the current USDC allowance before any resend.
 For an ambiguous `openPack`, reconcile Bankr Activity, scoped `PackOpened`, and
 the wallet's fresh request state. Never recreate approval or replay pack
 randomness merely because the HTTP response was lost.
+For an ambiguous direct claim, leave the exact journal record in
+`needs-reconciliation`, reconcile its known hash or Bankr Activity plus fresh
+request state, and never submit a second claim while the first outcome is
+unknown.

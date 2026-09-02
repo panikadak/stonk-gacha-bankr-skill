@@ -5,19 +5,20 @@
   "providerUrl": "https://punk.town/#/gacha",
   "logo": "logo.svg",
   "demo": {
-    "title": "stonk-gacha-direct-pull-v4.txt",
+    "title": "stonk-gacha-direct-pull-v5.txt",
     "language": "text",
-    "code": "You:   Pull me a $10 Stonk Gacha pack\nBankr: You pulled $20 of GOOGLc."
+    "code": "You:   @bankrbot install the skill at https://github.com/panikadak/stonk-gacha-bankr-skill and pull me a $10 Stonk Gacha\nBankr: You pulled $20 of GOOGLc."
   },
   "setup": [
     "Install the skill from its public GitHub repository URL",
     "Use the active Bankr EVM wallet on Base; never paste or expose a private key",
     "Keep Wallet API read-write access and arbitrary contract calls enabled for writes",
-    "Run the bundled live self-test once after install or update",
+    "Run the concise live deployment verification after install or update; full self-tests are release checks",
     "An already-funded direct pull binds the named price, approval/open replay baseline, and exact receipt-derived claim before silent delivery",
     "Every protocol write is planned as one unsigned transaction and verified after its mined receipt",
     "Funded quotes bind the response to.amount raw units to exact deficit or native-shortfall floors and reject oversized outputs",
-    "X approvals require trusted posted-text/channel metadata, replied_to parent binding, numeric identity, linked wallet, expiry, and atomic one-time consumption"
+    "X approvals require trusted posted-text/channel metadata, replied_to parent binding, numeric identity, linked wallet, expiry, and atomic one-time consumption",
+    "Funded pull confirmation covers swap, exact approval, open, and only that resulting request's same-wallet claim"
   ],
   "install": {
     "type": "bankr",

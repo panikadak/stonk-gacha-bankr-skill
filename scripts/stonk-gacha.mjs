@@ -29,6 +29,7 @@ import {
   getStorageAt,
   getTransaction,
   getTransactionCount,
+  isRetryableRpcTransportError,
   revertData,
   txSelector,
   unsignedTx,
@@ -118,6 +119,7 @@ import {
   verifyDeployment,
   walletRequests,
 } from "./lib/protocol.mjs";
+import { watchExactRequest } from "./lib/watch.mjs";
 
 const [, , command, ...argv] = process.argv;
 const ZERO_ROOT_VALIDATOR_RESULT = `0x${"0".repeat(64)}`;
@@ -141,7 +143,7 @@ const COMMAND_FLAGS = Object.freeze({
     "swap-slippage-bps", "quote-id", "swap-idempotency-key",
     "native-source-amount", "min-native-out", "quoted-native-out-wei", "native-swap-slippage-bps",
     "native-quote-id", "native-swap-idempotency-key", "native-headroom-wei",
-    "intent-ttl-seconds", "user-random",
+    "intent-ttl-seconds",
   ],
   "resume-open-pack-funding": ["wallet", "intent", "intent-key"],
   "bind-x-funding-intent": [
@@ -156,6 +158,10 @@ const COMMAND_FLAGS = Object.freeze({
   "plan-claim-prize": [
     "wallet", "request-id", "recipient", "slippage-bps",
     "claim-continuation", "claim-continuation-key",
+  ],
+  "await-claim-prize": [
+    "wallet", "request-id", "claim-continuation", "claim-continuation-key",
+    "max-wait-seconds", "poll-interval-seconds",
   ],
   "plan-expire-request": ["wallet", "request-id"],
   "plan-claim-refund": ["wallet", "request-id", "recipient"],
@@ -318,14 +324,54 @@ function snapshotView(snapshot) {
   return { blockNumber: snapshot.number, blockHash: snapshot.hash, timestamp: snapshot.timestamp };
 }
 
+function directPullJournalPath(wallet, requestId) {
+  const root = String(BANKR_EXECUTION.directPull.runtimeJournalRoot);
+  gate(/^\/[a-z0-9/-]+$/.test(root) && !root.endsWith("/"), "policy", "direct pull runtime journal root is invalid");
+  return `${root}/8453/${normalizeAddress(wallet)}/${BigInt(requestId)}.json`;
+}
+
+function directAwaitCommand(wallet, requestId, continuation, continuationKey, options = {}) {
+  const maxWait = options.maxWaitSeconds === undefined ? "" : ` --max-wait-seconds ${options.maxWaitSeconds}`;
+  const poll = options.pollIntervalSeconds === undefined ? "" : ` --poll-interval-seconds ${options.pollIntervalSeconds}`;
+  return `node scripts/stonk-gacha.mjs await-claim-prize --wallet ${wallet} --request-id ${requestId} --claim-continuation ${continuation} --claim-continuation-key ${continuationKey}${maxWait}${poll}`;
+}
+
+function directPullJournalRecord({
+  wallet,
+  requestId,
+  openTransactionHash,
+  continuation,
+  continuationKey,
+  continuationExpiresAt,
+  stage,
+  claimInspectionContextHex = null,
+  claimInspectionKey = null,
+  claimTransactionHash = null,
+}) {
+  return {
+    schemaVersion: 1,
+    chainId: 8453,
+    gacha: ADDR.gacha,
+    wallet,
+    requestId: BigInt(requestId),
+    openTransactionHash,
+    claimContinuation: continuation,
+    claimContinuationKey: continuationKey,
+    claimContinuationExpiresAt: BigInt(continuationExpiresAt),
+    stage,
+    claimInspectionContextHex,
+    claimInspectionKey,
+    claimTransactionHash,
+  };
+}
+
 function silentPullContinuation(wallet) {
   return {
     mode: "silent-until-delivered",
     pollIntervalSeconds: BANKR_EXECUTION.directPull.pollIntervalSeconds,
-    maximumSilentWaitSeconds: BANKR_EXECUTION.directPull.maximumSilentWaitSeconds,
-    requestCommand: `node scripts/stonk-gacha.mjs request --wallet ${wallet} --request-id REQUEST_ID`,
-    readyCommand: `node scripts/stonk-gacha.mjs plan-claim-prize --wallet ${wallet} --request-id REQUEST_ID --claim-continuation CLAIM_CONTINUATION --claim-continuation-key CLAIM_CONTINUATION_KEY`,
-    rule: "After inspect-tx proves PackOpened, take REQUEST_ID, CLAIM_CONTINUATION, and CLAIM_CONTINUATION_KEY only from that output's postStateProof. Poll that exact request without user-facing updates. When Ready, run the exact continuation-bound same-wallet claim command, inspect calldata, submit once, and inspect its receipt. Fill X only from the delivery inspect-tx postStateProof.payoutUsdcFormatted and SYMBOL only from postStateProof.symbol after currentStatus is Delivered. Never claim a different request, add recipient/slippage flags, relax the floor, or retry an ambiguous submission. If still Pending after the bounded wait, return only the pending request id.",
+    activeWatchSeconds: BANKR_EXECUTION.directPull.activeWatchSeconds,
+    awaitCommand: `node scripts/stonk-gacha.mjs await-claim-prize --wallet ${wallet} --request-id REQUEST_ID --claim-continuation CLAIM_CONTINUATION --claim-continuation-key CLAIM_CONTINUATION_KEY`,
+    rule: "After inspect-tx proves PackOpened, persist its exact internal resume record and immediately run its awaitCommand. Keep every Pending/Ready/claim step private. The await command watches only that receipt-bound request and emits a fresh same-wallet claim plan as soon as it is Ready. Inspect, submit once, inspect the receipt, and use only the verified finalMessage. Never select another request or show progress.",
     finalTemplate: "You pulled $X of SYMBOL.",
   };
 }
@@ -400,12 +446,12 @@ function inspectionKey(wallet, tx, contextHex) {
 
 function authorizedSubmitRule(authorization) {
   if (authorization.mode === "direct-pull-intent") {
-    return "Do not ask again only while the exact one-time direct pull intent is unexpired, its request-count baseline is unchanged, and this is the next unreconciled phase. Persist and mark the open step consumed before submission. Submit only this transaction with waitForConfirmation=true. Reconcile an unknown outcome from allowance, request state, and Bankr activity; never recreate or replay the intent.";
+    return "Do not ask again only while the exact one-time direct pull intent is unexpired, its request-count baseline is unchanged, and this is the next unreconciled phase. Persist and mark the open step consumed before submission. Submit only this transaction with waitForConfirmation=true. On success, inspect the receipt, persist its exact PackOpened request continuation, and immediately run its await command. Reconcile an unknown outcome from allowance, request state, and Bankr activity; never recreate or replay the intent.";
   }
   if (authorization.mode === "direct-claim-continuation") {
     return "Do not ask again only for the exact unexpired continuation whose source PackOpened receipt, wallet, request id, same-wallet recipient, and quote policy were re-proven. Mark this claim consumed before submission. Submit only this transaction with waitForConfirmation=true and inspect its receipt. An unknown outcome is a reconciliation stop, never permission to claim again or choose another request.";
   }
-  return "Do not ask again only if the runtime has the exact unexpired combined funding authorization, its one-time confirmation was atomically consumed, and this phase is the next unreconciled step in that execution journal. Submit only this transaction, wait for a successful receipt, then rerun the emitted resume command. A missing journal, changed term, or ambiguous prior submit is a hard stop, not permission to recreate approval.";
+  return "Do not ask again only if the runtime has the exact unexpired combined funding authorization, its one-time confirmation was atomically consumed, and this open is the next unreconciled step in that execution journal. Submit only this transaction and wait for a successful receipt. On success, inspect the receipt, persist its exact PackOpened request continuation, and immediately run its await command. A missing journal, changed term, or ambiguous prior submit is a hard stop, not permission to recreate or replay the open.";
 }
 
 function authorizedApprovalNext(authorization, resume) {
@@ -430,11 +476,21 @@ async function finalPlan({
   authorization = null,
   silentDirect = false,
   continuation = null,
+  runtimeJournal = null,
 }) {
   gate(!silentDirect || authorization, "planner", "silent execution requires a bound one-time authorization artifact");
   const preflight = await simulation(tx, wallet, snapshot.ref);
   await confirmSnapshot(snapshot);
   const inspection = encodeInspectionContext(action, terms);
+  const planInspectionKey = inspectionKey(wallet, tx, inspection.hex);
+  const boundRuntimeJournal = runtimeJournal ? {
+    ...runtimeJournal,
+    record: {
+      ...runtimeJournal.record,
+      claimInspectionContextHex: inspection.hex,
+      claimInspectionKey: planInspectionKey,
+    },
+  } : null;
   return {
     ok: true,
     command,
@@ -448,7 +504,7 @@ async function finalPlan({
     confirmationKey: confirmationKey(wallet, action, terms),
     inspectionContext: inspection.context,
     inspectionContextHex: inspection.hex,
-    inspectionKey: inspectionKey(wallet, tx, inspection.hex),
+    inspectionKey: planInspectionKey,
     ...(report && !silentDirect ? { report } : {}),
     warnings: silentDirect ? [] : warnings,
     txs: [tx],
@@ -464,6 +520,7 @@ async function finalPlan({
     } : {}),
     ...(resume ? { resume } : {}),
     ...(continuation ? { continuation } : {}),
+    ...(boundRuntimeJournal ? { runtimeJournal: boundRuntimeJournal } : {}),
     submitRule: authorization
       ? authorizedSubmitRule(authorization)
       : "Show the complete report and exact terms. Obtain explicit confirmation for this confirmationKey. Immediately re-run from fresh chain state using the emitted resume command when present. If the key or terms changed, obtain new confirmation. Submit only this one transaction with waitForConfirmation=true. Treat an unknown outcome as pending investigation, never as permission to replay.",
@@ -571,19 +628,14 @@ function openPackFundingRequired({ wallet, packIndex, usdcBalance, wethBalance, 
       path: FUNDING_POLICY.walletApi.portfolio.path,
       rule: "Match Base ERC-20 balances by exact address and keep decimal strings exact; do not parse balances as floating point.",
     },
-    sourceSelectionRequired: true,
-    instruction: `Do not choose or swap automatically. Show the eligible Base ETH and Base WETH balances above and ask the user which source to use. After the user names ETH or WETH, obtain the smallest exact-input Bankr quote whose minBuyAmount equals the ${options.exactDeficitUsdc} USDC deficit, then run plan-open-pack-funding with that quote's exact input amount, raw to.amount, floor, slippage, and a persistent UUID idempotency key. WETH does not satisfy native msg.value.`,
+    sourceSelectionRequired: "only-if-current-command-did-not-explicitly-name-base-eth-or-base-weth",
+    instruction: `Do not choose or swap automatically. If the current command explicitly names Base ETH or Base WETH, use only that source without asking again. Otherwise show the eligible choices above and ask one short source question. Then obtain the smallest exact-input Bankr quote whose minBuyAmount equals the ${options.exactDeficitUsdc} USDC deficit and run plan-open-pack-funding with that quote's exact input amount, raw to.amount, floor, slippage, and a persistent UUID idempotency key. WETH does not satisfy native msg.value.`,
     crossChainRule: "ETH or WETH on any other chain is not a Base balance. Any cross-chain acquisition is a separate confirmation that must name the source chain/token, maximum spend, bridge or network cost, and minimum canonical Base USDC output; it is never bundled silently with openPack.",
     lowerPackRule: "Never downgrade the pack automatically. A lower pack index requires a new explicit user choice and a fresh planner run.",
   });
 }
 
-function freshRandomArg() {
-  if (args["user-random"] !== undefined) {
-    const provided = bytes32Arg("user-random");
-    gate(!/^0x0{64}$/.test(provided), "randomness", "--user-random cannot be zero");
-    return { value: provided, generated: false };
-  }
+function freshRandom() {
   let value;
   do value = `0x${randomBytes(32).toString("hex")}`; while (/^0x0{64}$/.test(value));
   return { value, generated: true };
@@ -769,7 +821,7 @@ async function planOpenPack() {
         : "live Pyth Entropy fee exceeds the exact cap explicitly authorized by the user",
       { entropyFee, entropyFeeCap },
     );
-    const claimCapability = freshRandomArg();
+    const claimCapability = freshRandom();
     const userRandomNumber = directUserRandomNumber(claimCapability.value);
     randomGeneratedByPlanner = claimCapability.generated;
     try {
@@ -861,7 +913,6 @@ async function planOpenPack() {
     expectedEvents: ["PackOpened", "exact USDC Transfer wallet->StonkGacha"],
     postconditions: ["a new request owned by the active wallet is Pending", "request terms match the exact pinned offer", "USDC charge equals the selected pack price"],
     snapshot,
-    resume,
     authorization,
     silentDirect: true,
     continuation: silentPullContinuation(wallet),
@@ -917,7 +968,7 @@ async function planOpenPackFunding() {
   ]);
   gate(!salesPaused, "sales", "new pack sales are currently paused; funding must not proceed for a pack that cannot open");
   gate(usdcBalance < BigInt(offer.priceUsdc), "funding", "wallet already has enough canonical Base USDC; use plan-open-pack instead of moving another asset");
-  const random = freshRandomArg();
+  const claimCapability = freshRandom();
   let intent;
   try {
     intent = createFundingIntent({
@@ -947,7 +998,7 @@ async function planOpenPackFunding() {
       nativeSwapSlippageBps: nativeSwapSlippage,
       nativeQuoteId,
       nativeSwapIdempotencyKey,
-      userRandomNumber: random.value,
+      claimCapabilitySecret: claimCapability.value,
       createdAt: snapshot.timestamp,
       expiresAt: snapshot.timestamp + ttl,
     });
@@ -964,7 +1015,7 @@ async function planOpenPackFunding() {
   const fundingText = nativeLeg
     ? `run two Base swaps with at most ${intent.source.aggregateMaximumInput} WETH total: at most ${nativeLeg.amount} WETH for at least ${nativeLeg.minBuyAmount} native ETH at ${nativeLeg.slippageBps} bps, then at most ${usdcLeg.amount} WETH for at least ${usdcLeg.minBuyAmount} canonical Base USDC at ${usdcLeg.slippageBps} bps`
     : `swap at most ${usdcLeg.amount} ${intent.source.token} on Base for at least ${usdcLeg.minBuyAmount} canonical Base USDC at ${usdcLeg.slippageBps} bps`;
-  const report = `From wallet ${wallet}, ${fundingText}; ${approvalText}; then open pack index ${packIndex} for ${formatUnits(intent.pack.priceUsdcRaw, 6)} USDC using offer ${intent.pack.expectedOfferHash}, ceiling ${intent.pack.acceptedCeilingBps} bps, and a Pyth native fee capped at ${formatUnits(intent.pack.entropyFeeCapWei, 18)} ETH before intent expiry ${intent.expiresAt}?`;
+  const report = `From wallet ${wallet}, ${fundingText}; ${approvalText}; then open pack index ${packIndex} for ${formatUnits(intent.pack.priceUsdcRaw, 6)} USDC using offer ${intent.pack.expectedOfferHash}, ceiling ${intent.pack.acceptedCeilingBps} bps, and a Pyth native fee capped at ${formatUnits(intent.pack.entropyFeeCapWei, 18)} ETH before intent expiry ${intent.expiresAt}; finally deliver only that exact request's prize to this same wallet with the fixed 300 bps policy?`;
   await confirmSnapshot(snapshot);
   out({
     ok: true,
@@ -999,7 +1050,7 @@ async function planOpenPackFunding() {
     ],
     confirmationPolicy: {
       count: 1,
-      covers: ["every listed Bankr swap leg", "conditional stale-allowance reset", "exact USDC approval", "one openPack call"],
+      covers: ["every listed Bankr swap leg", "conditional stale-allowance reset", "exact USDC approval", "one openPack call", "same-wallet claim of only that resulting request"],
       condition: "The runtime must persist this exact intent and atomically consume the user's explicit approval once. A different source, maximum input, minimum output, pack, offer, ceiling, fee cap, wallet, or expiry requires a new confirmation.",
     },
     retryPolicy: {
@@ -1095,14 +1146,14 @@ async function resumeOpenPackFunding() {
         remainingIntent,
         remainingIntentHex,
         remainingIntentKey,
-        report: `Funding is complete, but the confirmed pack economics changed. Confirm only the remaining conditional allowance reset, exact ${formatUnits(BigInt(offer.priceUsdc), 6)} USDC approval, and one pack ${packIndex} open using offer ${offer.offerHash}, ceiling ${offer.ceilingBps} bps, exact native fee ${formatUnits(BigInt(offer.entropyFee), 18)} ETH, and expiry ${remainingIntent.expiresAt}. No swap is authorized by this replacement intent.`,
+        report: `Funding is complete, but the confirmed pack economics changed. Confirm only the remaining conditional allowance reset, exact ${formatUnits(BigInt(offer.priceUsdc), 6)} USDC approval, one pack ${packIndex} open using offer ${offer.offerHash}, ceiling ${offer.ceilingBps} bps, exact native fee ${formatUnits(BigInt(offer.entropyFee), 18)} ETH, and expiry ${remainingIntent.expiresAt}, followed by the default same-wallet claim of only that resulting request. No swap is authorized by this replacement intent.`,
         x: {
           preparedConfirmationTweet: preparedX,
           selfContainedFallbackCommand: xSelfContainedCommand(remainingIntent),
           bindAfterPosting: `node scripts/stonk-gacha.mjs bind-x-funding-intent --wallet ${wallet} --intent ${remainingIntentHex} --intent-key ${remainingIntentKey} --x-user-id NUMERIC_X_USER_ID --confirmation-tweet-id POSTED_TWEET_ID --confirmation-channel x --confirmation-message-hex ${preparedXHex}`,
         },
         resumeAfterFreshConfirmation: `node scripts/stonk-gacha.mjs resume-open-pack-funding --wallet ${wallet} --intent ${remainingIntentHex} --intent-key ${remainingIntentKey}`,
-        authorizationPolicy: "This is a new one-time intent for approve+open only. The old consumed authorization cannot approve these changed terms, and no funding swap may be replayed.",
+        authorizationPolicy: "This is a new one-time intent for approve+open+same-resulting-request-claim only. The old consumed authorization cannot approve these changed terms, and no funding swap may be replayed.",
         txs: [],
       });
       return;
@@ -1141,6 +1192,7 @@ async function resumeOpenPackFunding() {
     entropyFeeCapWei: BigInt(intent.pack.entropyFeeCapWei),
     userRandomNumber: intent.pack.userRandomNumber,
     approval: { token: ADDR.usdc, spender: ADDR.gacha, exactAmount: priceUsdc },
+    fundingIntent: intentHex,
     fundingIntentKey: expectedIntentKey,
     fundingIntentExpiresAt: BigInt(intent.expiresAt),
     fundingBaselineRequestCount: BigInt(resumePreflight.walletRequestCount),
@@ -1190,9 +1242,9 @@ async function resumeOpenPackFunding() {
     expectedEvents: ["PackOpened", "exact USDC Transfer wallet->StonkGacha"],
     postconditions: ["a new request owned by the active wallet is Pending", "request terms match the exact confirmed offer", "USDC charge equals the selected pack price"],
     snapshot,
-    resume,
     authorization,
     silentDirect: true,
+    continuation: silentPullContinuation(wallet),
   }));
 }
 
@@ -1363,7 +1415,8 @@ async function planClaimPrize() {
     ...(silentDirect ? {
       directClaimContinuation: directContinuationHex,
       directClaimContinuationKey: directContinuationKeyValue,
-      directPullIntentKey: directContinuation.sourceOpenProof.directPullIntentKey,
+      sourceAuthorizationKind: directContinuation.sourceOpenProof.authorizationKind,
+      sourceAuthorizationKey: directContinuation.sourceOpenProof.authorizationKey,
       sourceOpenTransactionHash: directContinuation.sourceOpenProof.transactionHash,
     } : {}),
   };
@@ -1393,7 +1446,200 @@ async function planClaimPrize() {
       runtimeGate: "Submit only the receipt-bound request in this unexpired continuation. Mark the claim consumed before submission; an unknown outcome must be reconciled and never replayed.",
     } : null,
     silentDirect,
+    runtimeJournal: silentDirect ? {
+      visibility: "internal-only",
+      action: "transition-to-claim-submitting-before-submit",
+      expectedPriorStages: ["awaiting-settlement", "ready"],
+      path: directPullJournalPath(wallet, requestId),
+      record: directPullJournalRecord({
+        wallet,
+        requestId,
+        openTransactionHash: directContinuation.sourceOpenProof.transactionHash,
+        continuation: directContinuationHex,
+        continuationKey: directContinuationKeyValue,
+        continuationExpiresAt: directContinuation.expiresAt,
+        stage: "claim-submitting",
+      }),
+      rule: "Before Bankr submission, update this exact request from awaiting-settlement or ready to claim-submitting. If another execution changed it, reconcile first. If submission is ambiguous, reconcile the exact request and Bankr activity; never submit a second claim blindly.",
+    } : null,
   }));
+}
+
+async function awaitClaimPrize() {
+  const wallet = walletArg();
+  const requestId = requestIdArg();
+  const continuationHex = String(need("claim-continuation"));
+  const continuationKey = bytes32Arg("claim-continuation-key");
+  const maxWaitSeconds = args["max-wait-seconds"] === undefined
+    ? BigInt(BANKR_EXECUTION.directPull.activeWatchSeconds)
+    : integerArg("max-wait-seconds", { min: 1n, max: BigInt(BANKR_EXECUTION.directPull.maximumActiveWatchSeconds) });
+  const pollIntervalSeconds = args["poll-interval-seconds"] === undefined
+    ? BigInt(BANKR_EXECUTION.directPull.pollIntervalSeconds)
+    : integerArg("poll-interval-seconds", { min: 1n, max: 30n });
+  gate(pollIntervalSeconds <= maxWaitSeconds, "args", "poll interval cannot exceed the active watch window");
+
+  let continuation;
+  try {
+    continuation = decodeDirectClaimContinuation(continuationHex);
+  } catch (error) {
+    throw new GateError("direct-claim-continuation", error.message);
+  }
+  gate(directClaimContinuationKey(continuation) === continuationKey, "direct-claim-continuation", "direct claim continuation key mismatch");
+
+  const { snapshot } = await deploymentGate();
+  const initialRequest = await readRequest(requestId, snapshot);
+  await confirmSnapshot(snapshot);
+  const assessment = assessDirectClaimContinuation(continuation, {
+    wallet,
+    requestId,
+    timestamp: snapshot.timestamp,
+    recipient: wallet,
+    slippageBps: DIRECT_CLAIM_SLIPPAGE_BPS,
+  });
+  gate(assessment.ok, "direct-claim-continuation", "direct claim continuation no longer authorizes this exact delivery", { issues: assessment.issues });
+  await proveDirectClaimSource(continuation);
+  gate(initialRequest.buyer === wallet, "buyer", "watched request buyer differs from the active wallet");
+
+  const outcome = await watchExactRequest({
+    wallet,
+    requestId,
+    continuationExpiresAt: continuation.expiresAt,
+    timeoutMs: Number(maxWaitSeconds * 1_000n),
+    pollIntervalMs: Number(pollIntervalSeconds * 1_000n),
+    maxConsecutiveTransportErrors: Number(BANKR_EXECUTION.directPull.maximumConsecutiveTransportErrors),
+    maxTransportBackoffMs: Number(BANKR_EXECUTION.directPull.maximumTransportBackoffSeconds) * 1_000,
+    isRetryableTransportError: isRetryableRpcTransportError,
+    readRequest: async (exactRequestId) => {
+      const exactSnapshot = await beginSnapshot();
+      const request = await readRequest(exactRequestId, exactSnapshot);
+      await confirmSnapshot(exactSnapshot);
+      return request;
+    },
+  });
+
+  if (outcome.outcome === "ready") return await planClaimPrize();
+  if (outcome.outcome === "delivered") {
+    const journalPath = directPullJournalPath(wallet, requestId);
+    out({
+      ok: false,
+      command,
+      phase: "delivered-needs-receipt-proof",
+      gate: "claim-receipt-reconciliation",
+      wallet,
+      requestId,
+      txs: [],
+      runtimeJournal: {
+        visibility: "internal-only",
+        action: "mark-needs-reconciliation-preserve-claim-proof",
+        path: journalPath,
+        patch: { stage: "needs-reconciliation" },
+        rule: "Preserve any claim inspection context, inspection key, and transaction hash already stored for this request.",
+      },
+      presentation: {
+        mode: "silent-reconciliation",
+        rule: "Do not post a result from request state alone. Recover the exact successful claim transaction from the private journal or Bankr Activity, then run inspect-tx and require its proved recipient to be the active wallet before using finalMessage.",
+      },
+    }, 2);
+    return;
+  }
+
+  const journalPath = directPullJournalPath(wallet, requestId);
+  const record = directPullJournalRecord({
+    wallet,
+    requestId,
+    openTransactionHash: continuation.sourceOpenProof.transactionHash,
+    continuation: continuationHex,
+    continuationKey,
+    continuationExpiresAt: continuation.expiresAt,
+    stage: outcome.outcome === "pending-timeout" ? "awaiting-settlement" : outcome.outcome,
+  });
+  if (outcome.outcome === "pending-timeout") {
+    const latest = outcome.request ?? initialRequest;
+    if (latest.status === "Pending" && BigInt(latest.snapshot.timestamp) >= BigInt(latest.refundableAt)) {
+      out({
+        ok: false,
+        command,
+        phase: "settlement-window-ended",
+        gate: "user-choice-required",
+        wallet,
+        requestId,
+        txs: [],
+        runtimeJournal: { visibility: "internal-only", action: "upsert", path: journalPath, record },
+        presentation: {
+          mode: "minimal-blocker",
+          userPrompt: `Pull #${requestId} did not settle in time. Expire it and claim the $${latest.paidUsdcFormatted} refund?`,
+        },
+      }, 2);
+      return;
+    }
+    const next = directAwaitCommand(wallet, requestId, continuationHex, continuationKey);
+    out({
+      ok: true,
+      command,
+      phase: "awaiting-settlement",
+      wallet,
+      requestId,
+      txs: [],
+      next,
+      runtimeJournal: { visibility: "internal-only", action: "upsert", path: journalPath, record },
+      presentation: {
+        mode: "silent-continue",
+        rule: "Do not post progress. Run next immediately while the current job can continue; otherwise retain the internal record for the next Stonk Gacha invocation.",
+      },
+    });
+    return;
+  }
+  if (outcome.outcome === "expired") {
+    out({
+      ok: false,
+      command,
+      phase: "expired",
+      gate: "user-choice-required",
+      wallet,
+      requestId,
+      txs: [],
+      runtimeJournal: { visibility: "internal-only", action: "upsert", path: journalPath, record },
+      presentation: {
+        mode: "minimal-blocker",
+        userPrompt: `Pull #${requestId} expired. Claim the $${outcome.request.paidUsdcFormatted} refund?`,
+      },
+    }, 2);
+    return;
+  }
+  if (outcome.outcome === "refunded") {
+    out({
+      ok: true,
+      command,
+      phase: "refunded",
+      wallet,
+      requestId,
+      txs: [],
+      runtimeJournal: { visibility: "internal-only", action: "mark-refunded", path: journalPath, record },
+      presentation: { mode: "final-only", finalMessage: `Pull #${requestId} expired and was refunded.` },
+    });
+    return;
+  }
+  if (outcome.outcome === "continuation-expired") {
+    out({
+      ok: false,
+      command,
+      phase: "claim-authorization-expired",
+      gate: "fresh-confirmation-required",
+      wallet,
+      requestId,
+      requestStatus: outcome.status,
+      txs: [],
+      runtimeJournal: { visibility: "internal-only", action: "mark-authorization-expired", path: journalPath, record },
+      presentation: {
+        mode: "minimal-blocker",
+        userPrompt: outcome.status === "Ready"
+          ? `Pull #${requestId} is ready. Claim it now?`
+          : `Pull #${requestId} still needs attention. Continue?`,
+      },
+    }, 2);
+    return;
+  }
+  throw new GateError("request-status", `exact request watch stopped in unsupported state ${outcome.status ?? outcome.outcome}`);
 }
 
 async function planExpireRequest() {
@@ -1590,7 +1836,33 @@ async function inspectLogicalCall({ wallet, tx, contextHex, expectedInspectionKe
     gate(fundedOpen || directOpen, "inspection-context", "open-pack requires a bound funded or direct one-time intent");
   }
   if (fundedOpen) {
+    gate(typeof terms.fundingIntent === "string", "inspection-context", "funding intent is missing from the bound context");
     gate(/^0x[0-9a-f]{64}$/.test(String(terms.fundingIntentKey)), "inspection-context", "funding intent key is malformed");
+    let fundingIntent;
+    try {
+      fundingIntent = decodeFundingIntent(terms.fundingIntent);
+    } catch (error) {
+      throw new GateError("funding-intent", error.message);
+    }
+    gate(fundingIntentKey(fundingIntent) === String(terms.fundingIntentKey).toLowerCase(), "funding-intent", "bound funding intent key mismatch");
+    gate(fundingIntent.wallet === wallet, "funding-intent", "funding intent wallet differs from the active Bankr wallet");
+    assertContextString(fundingIntent.pack.packIndex, terms.packIndex, "funded-open pack index");
+    assertContextString(fundingIntent.pack.priceUsdcRaw, terms.packPriceUsdc, "funded-open pack price");
+    assertContextString(fundingIntent.pack.expectedOfferHash, terms.expectedOfferHash, "funded-open offer hash");
+    assertContextString(fundingIntent.pack.acceptedCeilingBps, terms.minCeilingBps, "funded-open ceiling");
+    assertContextString(fundingIntent.pack.entropyFeeCapWei, terms.entropyFeeCapWei, "funded-open Entropy fee cap");
+    assertContextString(fundingIntent.pack.userRandomNumber, terms.userRandomNumber, "funded-open randomness");
+    const fundingPreflight = fundingIntent.stage === "remaining-open"
+      ? fundingIntent.remainingPreflight
+      : fundingIntent.preflight;
+    assertContextString(fundingIntent.expiresAt, terms.fundingIntentExpiresAt, "funded-open intent expiry");
+    assertContextString(fundingPreflight.walletRequestCount, terms.fundingBaselineRequestCount, "funded-open request-count baseline");
+    assertContextString(fundingPreflight.nativeHeadroomWei, terms.fundingNativeHeadroomWei, "funded-open native headroom");
+    assertContextString(fundingIntent.approvalPolicy.token, terms.approval?.token, "funded-open approval token");
+    assertContextString(fundingIntent.approvalPolicy.spender, terms.approval?.spender, "funded-open approval spender");
+    assertContextString(fundingIntent.approvalPolicy.exactAmountUsdcRaw, terms.approval?.exactAmount, "funded-open approval amount");
+    gate(fundingIntent.deliveryPolicy?.recipient === wallet, "funding-intent", "funded-open delivery is not bound to the active wallet");
+    gate(fundingIntent.deliveryPolicy?.slippageBps === DIRECT_CLAIM_SLIPPAGE_BPS, "funding-intent", "funded-open delivery slippage differs from policy");
     const intentExpiry = BigInt(terms.fundingIntentExpiresAt);
     const baselineRequestCount = BigInt(terms.fundingBaselineRequestCount);
     const nativeHeadroom = BigInt(terms.fundingNativeHeadroomWei);
@@ -1780,7 +2052,8 @@ async function inspectLogicalCall({ wallet, tx, contextHex, expectedInspectionKe
       assertContextString(continuation.requestId, requestId, "direct claim request id");
       assertContextString(continuation.deliveryPolicy.recipient, recipient, "direct claim recipient");
       assertContextString(continuation.deliveryPolicy.slippageBps, slippage, "direct claim slippage");
-      assertContextString(continuation.sourceOpenProof.directPullIntentKey, terms.directPullIntentKey, "direct claim source intent key");
+      assertContextString(continuation.sourceOpenProof.authorizationKind, terms.sourceAuthorizationKind, "direct claim source authorization kind");
+      assertContextString(continuation.sourceOpenProof.authorizationKey, terms.sourceAuthorizationKey, "direct claim source authorization key");
       assertContextString(continuation.sourceOpenProof.transactionHash, terms.sourceOpenTransactionHash, "direct claim source transaction");
       if (verifyFreshState) {
         const assessment = assessDirectClaimContinuation(continuation, {
@@ -2147,12 +2420,27 @@ async function proveDirectClaimSource(continuation) {
     verifyFreshState: false,
   });
   gate(inspection.action.name === "open-pack", "direct-claim-source", "bound source transaction is not an openPack call");
-  assertContextString(inspection.context.terms.directPullIntentKey, source.directPullIntentKey, "source direct pull intent key");
   let sourceIntent;
-  try {
-    sourceIntent = decodeDirectPullIntent(inspection.context.terms.directPullIntent);
-  } catch (error) {
-    throw new GateError("direct-claim-source", `bound source direct intent is invalid: ${error.message}`);
+  if (source.authorizationKind === "direct-pull-intent") {
+    assertContextString(inspection.context.terms.directPullIntentKey, source.authorizationKey, "source direct pull intent key");
+    try {
+      sourceIntent = decodeDirectPullIntent(inspection.context.terms.directPullIntent);
+    } catch (error) {
+      throw new GateError("direct-claim-source", `bound source direct intent is invalid: ${error.message}`);
+    }
+    gate(directPullIntentKey(sourceIntent) === source.authorizationKey, "direct-claim-source", "bound source direct intent key mismatch");
+  } else if (source.authorizationKind === "funded-open-intent") {
+    assertContextString(inspection.context.terms.fundingIntentKey, source.authorizationKey, "source funded open intent key");
+    try {
+      sourceIntent = decodeFundingIntent(inspection.context.terms.fundingIntent);
+    } catch (error) {
+      throw new GateError("direct-claim-source", `bound source funded intent is invalid: ${error.message}`);
+    }
+    gate(fundingIntentKey(sourceIntent) === source.authorizationKey, "direct-claim-source", "bound source funded intent key mismatch");
+    gate(sourceIntent.deliveryPolicy?.recipient === wallet, "direct-claim-source", "bound source funded intent does not authorize same-wallet delivery");
+    gate(sourceIntent.deliveryPolicy?.slippageBps === DIRECT_CLAIM_SLIPPAGE_BPS, "direct-claim-source", "bound source funded intent delivery policy changed");
+  } else {
+    throw new GateError("direct-claim-source", "bound source authorization kind is unsupported");
   }
   const executionProof = await proveBankrExecutionReceipt(envelope, transaction, receipt);
   const receiptIdentity = executionProof.receiptBlockIdentity;
@@ -2189,7 +2477,8 @@ async function proveDirectClaimSource(continuation) {
     transactionHash: source.transactionHash,
     requestId: eventProof.PackOpened.requestId,
     buyer: wallet,
-    directPullIntentKey: source.directPullIntentKey,
+    authorizationKind: source.authorizationKind,
+    authorizationKey: source.authorizationKey,
     deploymentIntegrityAtReceipt: true,
     bankrExecutionProven: true,
   };
@@ -2210,14 +2499,23 @@ async function postActionState(actionName, eventProof, context, receiptBinding =
     );
     gate(requestHash === String(context.terms.expectedOfferHash).toLowerCase(), "post-state", "stored request offer commitment does not match the confirmed receipt");
     const result = { requestId: opened.requestId, currentStatus: request.status, immutableRequestTermsMatch: true };
-    if (context.terms.directPullIntentKey !== undefined) {
-      gate(receiptBinding, "post-state", "direct open receipt binding is unavailable");
+    const sourceAuthorizationKind = context.terms.directPullIntentKey !== undefined
+      ? "direct-pull-intent"
+      : context.terms.fundingIntentKey !== undefined && context.terms.fundingIntent !== undefined
+        ? "funded-open-intent"
+        : null;
+    if (sourceAuthorizationKind) {
+      gate(receiptBinding, "post-state", "pull open receipt binding is unavailable");
+      const sourceAuthorizationKey = sourceAuthorizationKind === "direct-pull-intent"
+        ? context.terms.directPullIntentKey
+        : context.terms.fundingIntentKey;
       let continuation;
       try {
         continuation = createDirectClaimContinuation({
           wallet: opened.buyer,
           requestId: opened.requestId,
-          directPullIntentKey: context.terms.directPullIntentKey,
+          sourceAuthorizationKind,
+          sourceAuthorizationKey,
           openTransactionHash: receiptBinding.transactionHash,
           openInspectionKey: receiptBinding.inspectionKey,
           openInspectionContextHex: receiptBinding.inspectionContextHex,
@@ -2227,11 +2525,31 @@ async function postActionState(actionName, eventProof, context, receiptBinding =
       } catch (error) {
         throw new GateError("post-state", `could not create receipt-bound claim continuation: ${error.message}`);
       }
+      const encodedContinuation = encodeDirectClaimContinuation(continuation);
+      const continuationKey = directClaimContinuationKey(continuation);
+      const journalPath = directPullJournalPath(opened.buyer, opened.requestId);
+      const awaitCommand = directAwaitCommand(opened.buyer, opened.requestId, encodedContinuation, continuationKey);
       return {
         ...result,
-        claimContinuation: encodeDirectClaimContinuation(continuation),
-        claimContinuationKey: directClaimContinuationKey(continuation),
+        openTransactionHash: receiptBinding.transactionHash,
+        claimContinuation: encodedContinuation,
+        claimContinuationKey: continuationKey,
         claimContinuationExpiresAt: continuation.expiresAt,
+        awaitCommand,
+        runtimeJournal: {
+          visibility: "internal-only",
+          action: "upsert-before-await",
+          path: journalPath,
+          record: directPullJournalRecord({
+            wallet: opened.buyer,
+            requestId: opened.requestId,
+            openTransactionHash: receiptBinding.transactionHash,
+            continuation: encodedContinuation,
+            continuationKey,
+            continuationExpiresAt: continuation.expiresAt,
+            stage: request.status === "Ready" ? "ready" : "awaiting-settlement",
+          }),
+        },
       };
     }
     return result;
@@ -2241,7 +2559,7 @@ async function postActionState(actionName, eventProof, context, receiptBinding =
     const request = await readRequest(delivered.requestId);
     gate(request.status === "Delivered" && BigInt(request.stockOut) === delivered.stockOut, "post-state", "delivered request record does not match its receipt");
     gate(request.buyer === delivered.buyer && request.token === delivered.token && BigInt(request.payoutUsdc) === delivered.payoutUsdc, "post-state", "delivered request outcome changed or mismatches its receipt");
-    return {
+    const result = {
       requestId: delivered.requestId,
       currentStatus: request.status,
       payoutUsdc: request.payoutUsdc,
@@ -2252,7 +2570,37 @@ async function postActionState(actionName, eventProof, context, receiptBinding =
       recordedStockOutFormatted: request.tokenMeta?.decimals === null || request.tokenMeta?.decimals === undefined
         ? request.stockOut
         : formatUnits(BigInt(request.stockOut), request.tokenMeta.decimals),
+      finalMessage: `You pulled $${request.payoutUsdcFormatted} of ${request.tokenMeta?.symbol ?? request.token}.`,
     };
+    if (context.terms.directClaimContinuation !== undefined) {
+      let continuation;
+      try {
+        continuation = decodeDirectClaimContinuation(context.terms.directClaimContinuation);
+      } catch (error) {
+        throw new GateError("post-state", `delivered continuation is invalid: ${error.message}`);
+      }
+      return {
+        ...result,
+        runtimeJournal: {
+          visibility: "internal-only",
+          action: "mark-delivered",
+          path: directPullJournalPath(request.buyer, request.requestId),
+          record: directPullJournalRecord({
+            wallet: request.buyer,
+            requestId: request.requestId,
+            openTransactionHash: continuation.sourceOpenProof.transactionHash,
+            continuation: context.terms.directClaimContinuation,
+            continuationKey: context.terms.directClaimContinuationKey,
+            continuationExpiresAt: continuation.expiresAt,
+            stage: "delivered",
+            claimInspectionContextHex: receiptBinding?.inspectionContextHex ?? null,
+            claimInspectionKey: receiptBinding?.inspectionKey ?? null,
+            claimTransactionHash: receiptBinding?.transactionHash ?? null,
+          }),
+        },
+      };
+    }
+    return result;
   }
   if (actionName === "expire-request") {
     const expired = eventProof.PackExpired;
@@ -2337,6 +2685,21 @@ async function commandInspectTx() {
     receiptLogScope: range,
     eventProof,
     postStateProof,
+    ...(postStateProof?.awaitCommand ? {
+      next: postStateProof.awaitCommand,
+      runtimeJournal: postStateProof.runtimeJournal,
+      presentation: {
+        mode: "silent-continue",
+        rule: "Persist runtimeJournal, then run next immediately. Do not post approval, open, Pending, Ready, watcher, quote, or claim progress.",
+      },
+    } : {}),
+    ...(postStateProof?.finalMessage ? {
+      presentation: {
+        mode: "final-only",
+        finalMessage: postStateProof.finalMessage,
+        rule: "Reply with finalMessage verbatim and nothing else.",
+      },
+    } : {}),
     verdict: "mined successfully; supported Bankr execution, exact logical call, allowlisted context, and action-specific receipt evidence all passed",
   });
 }
@@ -2352,8 +2715,9 @@ function help() {
     ],
     planners: [
       "plan-open-pack --wallet --pack-index --authorized-price-usdc [--authorized-entropy-fee-wei --direct-intent --direct-intent-key]", "plan-revoke-usdc --wallet",
-      "plan-open-pack-funding --wallet --pack-index --source-token ETH|WETH --source-amount --min-usdc-out --quoted-usdc-out-raw --swap-slippage-bps [--quote-id --swap-idempotency-key --native-source-amount --min-native-out --quoted-native-out-wei --native-swap-slippage-bps --native-quote-id --native-swap-idempotency-key --native-headroom-wei --intent-ttl-seconds --user-random]",
+      "plan-open-pack-funding --wallet --pack-index --source-token ETH|WETH --source-amount --min-usdc-out --quoted-usdc-out-raw --swap-slippage-bps [--quote-id --swap-idempotency-key --native-source-amount --min-native-out --quoted-native-out-wei --native-swap-slippage-bps --native-quote-id --native-swap-idempotency-key --native-headroom-wei --intent-ttl-seconds]",
       "resume-open-pack-funding --wallet --intent --intent-key",
+      "await-claim-prize --wallet --request-id --claim-continuation --claim-continuation-key [--max-wait-seconds --poll-interval-seconds]",
       "plan-claim-prize --wallet --request-id [--recipient --slippage-bps | --claim-continuation --claim-continuation-key]",
       "plan-expire-request --wallet --request-id", "plan-claim-refund --wallet --request-id [--recipient]",
       "plan-fund-reserve --wallet --amount-usdc", "plan-distribute-profit --wallet [--amount-usdc --slippage-bps]",
@@ -2389,6 +2753,7 @@ async function main() {
     case "bind-x-funding-intent": return bindXIntent();
     case "verify-x-funding-approval": return verifyXApproval();
     case "plan-revoke-usdc": return await planRevokeUsdc();
+    case "await-claim-prize": return await awaitClaimPrize();
     case "plan-claim-prize": return await planClaimPrize();
     case "plan-expire-request": return await planExpireRequest();
     case "plan-claim-refund": return await planClaimRefund();
