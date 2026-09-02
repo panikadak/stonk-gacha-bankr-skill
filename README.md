@@ -1,10 +1,10 @@
 # Stonk Gacha Bankr Skill
 
 A deterministic, fail-closed Bankr skill for the live Stonk Gacha deployment on
-Base. Version 2 adds bounded Base ETH/WETH-to-USDC funding and replay-resistant
-X confirmations to the existing current-offer, request, planner, and receipt
-flows. The scripts never store keys, sign, broadcast, or manufacture swap
-calldata.
+Base. Version 3 makes an already-funded pull silent and direct: exact approval,
+one open, asynchronous result polling, and default same-wallet prize delivery
+run under the user's original command. The scripts never store keys, sign,
+broadcast, or manufacture swap calldata.
 
 ## Install in Bankr
 
@@ -33,8 +33,15 @@ reference](https://docs.bankr.bot/skills/in-bankr/skill-format/).
 - Each phase emits at most one unsigned transaction.
 - Approvals are exact and reset-first; calldata and receipt envelopes are
   independently inspected.
-- Current offers, sales state, Entropy fee, odds, quotes, and profit are read
-  live. They are never treated as repository constants.
+- Current offers, sales state, Entropy fee, quotes, and profit are read live.
+  They are never treated as repository constants or narrated during a direct
+  pull.
+- A direct command such as `pull me a $10` authorizes exactly one matching pack
+  and the default same-wallet delivery of that request after it becomes Ready.
+  The named `$10` is bound to the deployed pack price, approval/open replay is
+  blocked by a short-lived request-count intent, and claim authority is bound to
+  that exact `PackOpened` receipt. The intermediate approval, open, Pending
+  state, quote, and claim stay silent.
 - A USDC-short open reports the exact deficit and asks the user to choose Base
   ETH or WETH. It never auto-selects a token or lowers the pack.
 - After source choice, one bounded confirmation can cover the listed Bankr
@@ -53,6 +60,21 @@ Read [SKILL.md](SKILL.md) for the agent workflow,
 receipt rules. X runtimes must also follow
 [references/x-confirmation.md](references/x-confirmation.md).
 
+## Direct pull
+
+When the active wallet already holds enough canonical Base USDC and native ETH,
+an explicit request such as `pull me a $10` runs without a second conversational
+confirmation. Bankr submits any exact approval phase, opens one matching pack,
+waits for the request to become Ready, delivers the prize to the same wallet
+using the default nonzero output floor, and replies only after proof:
+
+```text
+$20 USDC purchase of GOOGLc arrived.
+```
+
+Any funding trade, alternate recipient, custom slippage, changed terms, or
+ambiguous submission stops the silent lifecycle and requires a new user choice.
+
 ## Funded pack open
 
 Start with the ordinary planner:
@@ -60,7 +82,8 @@ Start with the ordinary planner:
 ```bash
 node scripts/stonk-gacha.mjs plan-open-pack \
   --wallet 0xYourActiveBankrEvmWallet \
-  --pack-index 1
+  --pack-index 1 \
+  --authorized-price-usdc 10
 ```
 
 If canonical Base USDC is short, it returns `choose-funding-source` with the
@@ -136,8 +159,8 @@ node scripts/stonk-gacha.mjs offers --wallet 0xYourActiveBankrEvmWallet
 node scripts/stonk-gacha.mjs requests --wallet 0xYourActiveBankrEvmWallet
 ```
 
-Planner output is not authorization and is not submitted by these scripts. A
-Bankr execution must preserve the exact planned transaction and pass both
+The user's current explicit action command is the authorization; planner output
+alone is not. Bankr must preserve the exact planned transaction and pass both
 `inspect-calldata` and `inspect-tx`.
 
 ## License

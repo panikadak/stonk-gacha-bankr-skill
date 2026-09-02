@@ -12,11 +12,9 @@ a separate exact native fee. The request pins the reserve-backed ceiling,
 ordered eligible stock addresses, and ordered cached route hashes before any
 payment moves.
 
-Do not publish an odds table from this repository. Read the contract's `odds`,
-`packPrice`, `ceilingTiers`, `effectiveRtpBps`, `TARGET_RTP_BPS`, and
-`HOUSE_EDGE_BPS`, then label RTP and edge as nominal. A final `payoutUsdc` is a
-request-scoped budget spent to buy stock; it is not a fixed-value token promise.
-Only `stockOut` after delivery is the measured token amount.
+A final `payoutUsdc` is the request-scoped budget spent to buy stock. Only
+`stockOut` after delivery is the measured token amount. Keep offer and economic
+telemetry internal unless the user explicitly requests a read-only analysis.
 
 The request state machine is:
 
@@ -51,7 +49,7 @@ stop until the reviewed deployment reference is updated.
 ### `status`, `offers`, and `offer`
 
 `status` reports sales state, reserve/liability accounting, current Entropy fee,
-wallet USDC/ETH/allowance, current offers, and nominal contract-published terms.
+wallet USDC/ETH/allowance, and current offers.
 `offers` reports every current pack offer. `offer --pack-index N` reports one
 offer, including current price, ceiling, ordered tokens, ordered route hashes,
 contract offer hash, and locally reproduced hash.
@@ -80,13 +78,15 @@ raw donations strengthen cash backing but do not create realized profit.
 
 Every planner runs the deployment gate, builds its terms from fresh pinned
 reads, simulates, and emits no more than one unsigned transaction. Follow
-`bankr-execution.md` for confirmation, inspection, submission, and receipt
+`bankr-execution.md` for authorization, inspection, submission, and receipt
 proof.
 
 ### `plan-open-pack`
 
 Preconditions:
 
+- the exact amount named by the user is passed as `--authorized-price-usdc`
+  and equals both the deployed pack-index price and the live contract price;
 - active wallet is resolved and has enough USDC for the contract-read price;
 - it has enough Base ETH for the exact live Entropy fee; gas sponsorship does
   not remove the wallet's inner call-value requirement;
@@ -96,12 +96,24 @@ Preconditions:
 - the wallet allowance is exactly the required pack price.
 
 The planner uses the current ceiling as `minCeilingBps`, the exact reproduced
-offer hash, and a fresh nonzero cryptographic 32-byte contribution. It sends the
-exact current Entropy fee as the inner call value; overpayment is forbidden.
-The contribution is public calldata, not a secret. Carry it only across the
-same still-unsubmitted approval flow using the planner's exact resume command.
-After any open submission attempt or unknown outcome, inspect requests and use
-a newly generated contribution for any new attempt.
+offer hash, and a fresh nonzero cryptographic 32-byte claim-capability preimage.
+Its domain-separated Keccak commitment is the onchain Pyth user contribution,
+so a continuation for an unrelated historical open cannot be fabricated from
+public chain data. Keep the preimage only inside the opaque intent and
+receipt-bound continuation. The planner wraps
+the named price, pack, offer, ceiling, fee cap, randomness, wallet, approval,
+same-wallet delivery policy, short expiry, and wallet request-count baseline in
+a canonical direct intent. It sends the exact current Entropy fee as the inner
+call value; overpayment is forbidden. Only the derived commitment is public
+calldata; the capability preimage is not. Carry it only across the same
+still-unsubmitted approval flow using
+the planner's exact intent/key resume command. After an open lands, the changed
+request count makes that intent unusable. After any unknown submission outcome,
+reconcile requests and Bankr activity; never create or replay another action
+from the same user command.
+The normal silent path uses the reviewed Entropy fee cap. A live fee above that
+cap emits no transaction; `--authorized-entropy-fee-wei` may be supplied only
+after the user explicitly accepts the exact higher cap.
 
 If allowance is mismatched, the only output is an exact approval phase: reset a
 nonzero stale allowance to zero, or approve exactly the current price. After the
@@ -111,13 +123,20 @@ If the wallet lacks USDC, report the exact deficit and stop at
 ETH, and Base WETH. Show eligible ETH and WETH balances and ask which one the
 user wants to spend. Never select a token or lower the pack automatically.
 
-An ordinary `plan-open-pack` with sufficient USDC still uses its normal
-confirmation. The combined funding authorization below exists only after an
-explicit source choice.
+An explicit current command for one matching pack authorizes an ordinary
+`plan-open-pack` with sufficient USDC and native ETH. Run its reset/approval and
+open phases silently while fresh replans retain the exact unexpired direct
+intent/key and unchanged request baseline. After the verified open, take the
+request id and opaque claim continuation only from its `inspect-tx`
+`postStateProof`, then poll that request silently. When it becomes `Ready`, run
+`plan-claim-prize` with that exact continuation/key without another prompt. The
+combined funding authorization below exists only after an explicit source
+choice and does not silently authorize prize claim.
 
 Postcondition: a scoped `PackOpened` event, an exact canonical official-USDC
 transfer from the wallet to Gacha, and a fresh request in `Pending`. Do not
-report a token, multiplier, payout, win, or delivery yet.
+report a token, multiplier, payout, win, or delivery yet; continue the direct
+pull lifecycle silently.
 
 ### `plan-open-pack-funding`
 
@@ -231,6 +250,18 @@ The default slippage tolerance is 300 bps, so `minOut` is a nonzero 97% floor;
 the user may explicitly choose another valid tolerance. Use a short fresh
 deadline. Default recipient to the active wallet; an alternate recipient must
 be explicit and reconfirmed.
+
+For the same request created by a current direct pull, the original command
+also authorizes default-recipient delivery with the default 300 bps tolerance,
+but only through the short-lived claim continuation emitted after `inspect-tx`
+proves the exact source `PackOpened` receipt. The continuation binds the source
+transaction, source inspection context/key, direct intent key, wallet, exact
+request id, same-wallet recipient, and slippage policy. Both planning and
+`inspect-calldata` re-prove the historical Bankr execution and receipt. Do not
+ask again or surface the quote. Without that exact continuation, even a default
+same-wallet claim is a standalone write requiring its normal confirmation.
+Continuation authority is invalid for a different request, alternate
+recipient, custom tolerance, changed wallet, or expired continuation.
 
 Any route, liquidity, router, token-transfer, quote, or floor failure reverts the
 whole call and leaves the request `Ready` for a fresh retry. Never lower a floor

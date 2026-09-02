@@ -84,7 +84,6 @@ export const SIG = Object.freeze({
   packPrice: "packPrice(uint256)",
   odds: "odds()",
   ceilingTiers: "ceilingTiers()",
-  effectiveRtp: "effectiveRtpBps(uint256)",
   eligibleOffer: "eligibleOffer(uint256)",
   offerHash: "offerHash(uint256)",
   entropyFee: "entropyFee()",
@@ -378,14 +377,12 @@ export async function readOffer(packIndex, snapshot) {
   const freeReserveUsdc = decodeUint(freeReserveResult);
   if (entropyFee <= 0n || /^0x0{64}$/i.test(offerHash)) throw new Error("pack sale has no executable offer or Entropy fee");
   const validated = validateOffer({ packIndex, priceUsdc, ceilingBps, tokens: rawTokens, routeHashes, offerHash, freeReserveUsdc });
-  const nominalRtpBps = await readUint(ADDR.gacha, SIG.effectiveRtp, ["uint256"], [ceilingBps], block);
   const tokenMeta = await Promise.all(validated.tokens.map((token) => readTokenMeta(token, block)));
   return jsonValue({
     packIndex,
     priceUsdc,
     priceUsdcFormatted: formatUnits(priceUsdc, USDC_DECIMALS),
     ceilingBps,
-    nominalRtpBps,
     offerHash,
     computedOfferHash: validated.computedOfferHash,
     maxPayoutUsdc: validated.maxPayoutUsdc,

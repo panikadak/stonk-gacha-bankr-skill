@@ -57,6 +57,26 @@ import {
 } from "./lib/chain.mjs";
 import { eventTopic, keccak256, selector } from "./lib/keccak256.mjs";
 import {
+  DEFAULT_DIRECT_ENTROPY_FEE_CAP_WEI,
+  DIRECT_CLAIM_TTL_SECONDS,
+  DIRECT_CLAIM_SLIPPAGE_BPS,
+  DIRECT_PULL_TTL_SECONDS,
+  MAX_EXPLICIT_DIRECT_ENTROPY_FEE_CAP_WEI,
+  assessDirectClaimContinuation,
+  assessDirectPullIntent,
+  createDirectClaimContinuation,
+  createDirectPullIntent,
+  decodeDirectClaimContinuation,
+  decodeDirectPullIntent,
+  directClaimContinuationKey,
+  directPullIntentKey,
+  directUserRandomNumber,
+  encodeDirectClaimContinuation,
+  encodeDirectPullIntent,
+  validateDirectClaimContinuation,
+  validateDirectPullIntent,
+} from "./lib/direct.mjs";
+import {
   DEFAULT_NATIVE_HEADROOM_WEI,
   FUNDING_POLICY,
   NATIVE_SENTINEL,
@@ -369,23 +389,230 @@ check("exact desired allowance rejects reset", !requiresAllowanceReset(5n, 5n));
 check("zero allowance rejects reset", !requiresAllowanceReset(0n, 5n));
 rejects("reset predicate rejects nonpositive desired allowance", () => requiresAllowanceReset(5n, 0n), "positive desired amount");
 
+// A normal-language pull is reduced to a short-lived, canonical one-time
+// intent. The exact named dollar price, request-count baseline, offer, fee cap,
+// randomness, same-wallet delivery policy, and later receipt-bound claim are
+// executable invariants rather than prose instructions.
+const directCreatedAt = 1_788_345_000n;
+const directExpiresAt = directCreatedAt + DIRECT_PULL_TTL_SECONDS;
+const directOfferHash = keccak256("direct-offer");
+const directClaimCapabilitySecret = `0x${"24".repeat(32)}`;
+const directCommittedUserRandom = directUserRandomNumber(directClaimCapabilitySecret);
+check("direct claim capability commits to a nonzero distinct Pyth contribution", /^0x[0-9a-f]{64}$/.test(directCommittedUserRandom) && directCommittedUserRandom !== directClaimCapabilitySecret && !/^0x0{64}$/.test(directCommittedUserRandom));
+const directIntent = createDirectPullIntent({
+  wallet,
+  packIndex: 1,
+  authorizedPriceUsdcRaw: 10_000_000n,
+  packPriceUsdcRaw: 10_000_000n,
+  expectedOfferHash: directOfferHash,
+  acceptedCeilingBps: 100_000n,
+  entropyFeeObservedWei: DEFAULT_DIRECT_ENTROPY_FEE_CAP_WEI,
+  entropyFeeCapWei: DEFAULT_DIRECT_ENTROPY_FEE_CAP_WEI,
+  feeAuthorization: "reviewed-default-cap",
+  claimCapabilitySecret: directClaimCapabilitySecret,
+  userRandomNumber: directCommittedUserRandom,
+  usdcBalance: 40_000_000n,
+  ethBalance: 2_000_000_000_000_000n,
+  allowance: 0n,
+  requestCount: 7n,
+  token: ADDR.usdc,
+  spender: ADDR.gacha,
+  createdAt: directCreatedAt,
+  expiresAt: directExpiresAt,
+});
+const directIntentHex = encodeDirectPullIntent(directIntent);
+const directIntentKeyValue = directPullIntentKey(directIntent);
+deepEqual("direct pull intent canonical round trip", decodeDirectPullIntent(directIntentHex), directIntent);
+equal("direct pull intent key survives round trip", directPullIntentKey(decodeDirectPullIntent(directIntentHex)), directIntentKeyValue);
+const directFresh = {
+  wallet,
+  packIndex: 1,
+  authorizedPriceUsdcRaw: 10_000_000n,
+  timestamp: directCreatedAt,
+  salesPaused: false,
+  packPriceUsdcRaw: 10_000_000n,
+  offerHash: directOfferHash,
+  computedOfferHash: directOfferHash,
+  ceilingBps: 100_000n,
+  entropyFeeWei: DEFAULT_DIRECT_ENTROPY_FEE_CAP_WEI,
+  usdcBalance: 40_000_000n,
+  ethBalance: 2_000_000_000_000_000n,
+  requestCount: 7n,
+  token: ADDR.usdc,
+  spender: ADDR.gacha,
+};
+check("unchanged direct pull intent resumes", assessDirectPullIntent(directIntent, directFresh).ok);
+const replayAssessment = assessDirectPullIntent(directIntent, { ...directFresh, requestCount: 8n });
+check("landed open blocks replay by request count", !replayAssessment.ok && replayAssessment.issues.some(({ code }) => code === "request-count-changed"));
+const expiredDirectAssessment = assessDirectPullIntent(directIntent, { ...directFresh, timestamp: directExpiresAt });
+check("direct pull expiry is exclusive", !expiredDirectAssessment.ok && expiredDirectAssessment.issues.some(({ code }) => code === "expired"));
+const futureDirectAssessment = assessDirectPullIntent(directIntent, { ...directFresh, timestamp: directCreatedAt - 1n });
+check("direct pull cannot start before creation", !futureDirectAssessment.ok && futureDirectAssessment.issues.some(({ code }) => code === "not-yet-valid"));
+const wrongAuthorizedPriceAssessment = assessDirectPullIntent(directIntent, { ...directFresh, authorizedPriceUsdcRaw: 20_000_000n });
+check("fresh direct pull preserves user-named price", !wrongAuthorizedPriceAssessment.ok && wrongAuthorizedPriceAssessment.issues.some(({ code }) => code === "authorization-price-changed"));
+const wrongPackAssessment = assessDirectPullIntent(directIntent, { ...directFresh, packIndex: 2 });
+check("fresh direct pull preserves exact pack index", !wrongPackAssessment.ok && wrongPackAssessment.issues.some(({ code }) => code === "pack-changed"));
+const changedDirectOfferAssessment = assessDirectPullIntent(directIntent, { ...directFresh, offerHash: keccak256("changed-direct-offer") });
+check("fresh direct pull preserves offer hash", !changedDirectOfferAssessment.ok && changedDirectOfferAssessment.issues.some(({ code }) => code === "offer-changed"));
+const changedDirectCeilingAssessment = assessDirectPullIntent(directIntent, { ...directFresh, ceilingBps: 50_000n });
+check("fresh direct pull preserves cash-backed ceiling", !changedDirectCeilingAssessment.ok && changedDirectCeilingAssessment.issues.some(({ code }) => code === "ceiling-changed"));
+const changedDirectFeeAssessment = assessDirectPullIntent(directIntent, { ...directFresh, entropyFeeWei: DEFAULT_DIRECT_ENTROPY_FEE_CAP_WEI + 1n });
+check("fresh direct pull enforces Entropy fee cap", !changedDirectFeeAssessment.ok && changedDirectFeeAssessment.issues.some(({ code }) => code === "fee-cap-exceeded"));
+const requestEightIntent = structuredClone(directIntent);
+requestEightIntent.preflight.walletRequestCount = "8";
+check("direct pull intent key changes with request baseline", directPullIntentKey(requestEightIntent) !== directIntentKeyValue);
+const changedRandomIntent = structuredClone(directIntent);
+changedRandomIntent.pack.claimCapabilitySecret = `0x${"25".repeat(32)}`;
+changedRandomIntent.pack.userRandomNumber = directUserRandomNumber(changedRandomIntent.pack.claimCapabilitySecret);
+check("direct pull intent key changes with claim capability", directPullIntentKey(changedRandomIntent) !== directIntentKeyValue);
+const changedExpiryIntent = structuredClone(directIntent);
+changedExpiryIntent.expiresAt = (directExpiresAt - 1n).toString();
+check("direct pull intent key changes with expiry", directPullIntentKey(changedExpiryIntent) !== directIntentKeyValue);
+const changedIntentOffer = structuredClone(directIntent);
+changedIntentOffer.pack.expectedOfferHash = keccak256("different-intent-offer");
+check("direct pull intent key changes with offer", directPullIntentKey(changedIntentOffer) !== directIntentKeyValue);
+const indexPriceMismatchIntent = structuredClone(directIntent);
+indexPriceMismatchIntent.pack.packIndex = 2;
+rejects("$10 cannot authorize deployed $20 pack index", () => validateDirectPullIntent(indexPriceMismatchIntent), "does not map");
+const priceMismatchIntent = structuredClone(directIntent);
+priceMismatchIntent.authorization.authorizedPriceUsdcRaw = "20000000";
+rejects("contract price must equal user-authorized price", () => validateDirectPullIntent(priceMismatchIntent), "differs");
+const longDirectIntent = structuredClone(directIntent);
+longDirectIntent.expiresAt = (directCreatedAt + DIRECT_PULL_TTL_SECONDS + 1n).toString();
+rejects("direct pull intent rejects excessive TTL", () => validateDirectPullIntent(longDirectIntent), "TTL");
+const wrongChainDirectIntent = structuredClone(directIntent);
+wrongChainDirectIntent.chainId = 1;
+rejects("direct pull intent rejects wrong chain", () => validateDirectPullIntent(wrongChainDirectIntent), "not for Base");
+const excessiveExplicitFeeIntent = structuredClone(directIntent);
+excessiveExplicitFeeIntent.authorization.feeAuthorization = "explicit-user-cap";
+excessiveExplicitFeeIntent.pack.entropyFeeCapWei = (MAX_EXPLICIT_DIRECT_ENTROPY_FEE_CAP_WEI + 1n).toString();
+rejects("direct pull intent rejects excessive explicit fee cap", () => validateDirectPullIntent(excessiveExplicitFeeIntent), "planner maximum");
+const zeroRandomDirectIntent = structuredClone(directIntent);
+zeroRandomDirectIntent.pack.userRandomNumber = `0x${"0".repeat(64)}`;
+rejects("direct pull intent rejects zero randomness", () => validateDirectPullIntent(zeroRandomDirectIntent), "cannot be zero");
+const wrongCapabilityDirectIntent = structuredClone(directIntent);
+wrongCapabilityDirectIntent.pack.claimCapabilitySecret = `0x${"26".repeat(32)}`;
+rejects("direct pull intent rejects fabricated claim capability", () => validateDirectPullIntent(wrongCapabilityDirectIntent), "not committed");
+const zeroCapabilityDirectIntent = structuredClone(directIntent);
+zeroCapabilityDirectIntent.pack.claimCapabilitySecret = `0x${"0".repeat(64)}`;
+rejects("direct pull intent rejects zero claim capability", () => validateDirectPullIntent(zeroCapabilityDirectIntent), "cannot be zero");
+const wrongTokenDirectIntent = structuredClone(directIntent);
+wrongTokenDirectIntent.approvalPolicy.token = otherWallet;
+rejects("direct pull intent pins canonical Base USDC", () => validateDirectPullIntent(wrongTokenDirectIntent), "canonical Base USDC");
+const wrongSpenderDirectIntent = structuredClone(directIntent);
+wrongSpenderDirectIntent.approvalPolicy.spender = otherWallet;
+rejects("direct pull intent pins verified Gacha spender", () => validateDirectPullIntent(wrongSpenderDirectIntent), "verified StonkGacha");
+const wrongRecipientDirectIntent = structuredClone(directIntent);
+wrongRecipientDirectIntent.deliveryPolicy.recipient = otherWallet;
+rejects("direct pull intent pins same-wallet delivery", () => validateDirectPullIntent(wrongRecipientDirectIntent), "active wallet");
+const wrongSlippageDirectIntent = structuredClone(directIntent);
+wrongSlippageDirectIntent.deliveryPolicy.slippageBps = DIRECT_CLAIM_SLIPPAGE_BPS + 1;
+rejects("direct pull intent pins delivery slippage", () => validateDirectPullIntent(wrongSlippageDirectIntent), "differs from policy");
+const injectedDirectIntent = structuredClone(directIntent);
+injectedDirectIntent.unreviewed = true;
+rejects("direct pull intent rejects injected fields", () => validateDirectPullIntent(injectedDirectIntent), "unsupported field");
+const consumedDirectIntent = structuredClone(directIntent);
+consumedDirectIntent.consumed = true;
+rejects("direct pull intent cannot begin consumed", () => validateDirectPullIntent(consumedDirectIntent), "begin unconsumed");
+
+const directClaimContinuation = createDirectClaimContinuation({
+  wallet,
+  requestId: 42n,
+  directPullIntentKey: directIntentKeyValue,
+  openTransactionHash: keccak256("direct-open-transaction"),
+  openInspectionKey: keccak256("direct-open-inspection"),
+  openInspectionContextHex: "0x7b7d",
+  createdAt: directCreatedAt,
+  expiresAt: directCreatedAt + DIRECT_CLAIM_TTL_SECONDS,
+});
+const directClaimHex = encodeDirectClaimContinuation(directClaimContinuation);
+const directClaimKeyValue = directClaimContinuationKey(directClaimContinuation);
+deepEqual("direct claim continuation canonical round trip", decodeDirectClaimContinuation(directClaimHex), directClaimContinuation);
+equal("direct claim continuation key survives round trip", directClaimContinuationKey(decodeDirectClaimContinuation(directClaimHex)), directClaimKeyValue);
+const directClaimFresh = {
+  wallet,
+  requestId: 42n,
+  timestamp: directCreatedAt,
+  recipient: wallet,
+  slippageBps: DIRECT_CLAIM_SLIPPAGE_BPS,
+};
+check("exact receipt-bound direct claim continues", assessDirectClaimContinuation(directClaimContinuation, directClaimFresh).ok);
+const wrongRequestClaim = assessDirectClaimContinuation(directClaimContinuation, { ...directClaimFresh, requestId: 41n });
+check("direct claim cannot select another Ready request", !wrongRequestClaim.ok && wrongRequestClaim.issues.some(({ code }) => code === "request-changed"));
+const expiredDirectClaim = assessDirectClaimContinuation(directClaimContinuation, { ...directClaimFresh, timestamp: directCreatedAt + DIRECT_CLAIM_TTL_SECONDS });
+check("direct claim continuation expiry is exclusive", !expiredDirectClaim.ok && expiredDirectClaim.issues.some(({ code }) => code === "expired"));
+const futureDirectClaim = assessDirectClaimContinuation(directClaimContinuation, { ...directClaimFresh, timestamp: directCreatedAt - 1n });
+check("direct claim cannot start before creation", !futureDirectClaim.ok && futureDirectClaim.issues.some(({ code }) => code === "not-yet-valid"));
+const changedRequestContinuation = structuredClone(directClaimContinuation);
+changedRequestContinuation.requestId = "43";
+check("direct claim key changes with request id", directClaimContinuationKey(changedRequestContinuation) !== directClaimKeyValue);
+const changedSourceContinuation = structuredClone(directClaimContinuation);
+changedSourceContinuation.sourceOpenProof.directPullIntentKey = keccak256("other-direct-intent");
+check("direct claim key changes with source intent", directClaimContinuationKey(changedSourceContinuation) !== directClaimKeyValue);
+const wrongRecipientContinuation = structuredClone(directClaimContinuation);
+wrongRecipientContinuation.deliveryPolicy.recipient = otherWallet;
+rejects("direct claim continuation rejects redirected recipient", () => validateDirectClaimContinuation(wrongRecipientContinuation), "active wallet");
+const wrongSlippageContinuation = structuredClone(directClaimContinuation);
+wrongSlippageContinuation.deliveryPolicy.slippageBps = DIRECT_CLAIM_SLIPPAGE_BPS + 1;
+rejects("direct claim continuation rejects changed slippage", () => validateDirectClaimContinuation(wrongSlippageContinuation), "differs from policy");
+const longClaimContinuation = structuredClone(directClaimContinuation);
+longClaimContinuation.expiresAt = (directCreatedAt + DIRECT_CLAIM_TTL_SECONDS + 1n).toString();
+rejects("direct claim continuation rejects excessive TTL", () => validateDirectClaimContinuation(longClaimContinuation), "TTL");
+const zeroRequestContinuation = structuredClone(directClaimContinuation);
+zeroRequestContinuation.requestId = "0";
+rejects("direct claim continuation rejects zero request id", () => validateDirectClaimContinuation(zeroRequestContinuation), "must be nonzero");
+const wrongChainClaimContinuation = structuredClone(directClaimContinuation);
+wrongChainClaimContinuation.chainId = 1;
+rejects("direct claim continuation rejects wrong chain", () => validateDirectClaimContinuation(wrongChainClaimContinuation), "not for Base");
+const injectedClaimContinuation = structuredClone(directClaimContinuation);
+injectedClaimContinuation.unreviewed = true;
+rejects("direct claim continuation rejects injected fields", () => validateDirectClaimContinuation(injectedClaimContinuation), "unsupported field");
+
 // The CLI's randomness boundary is intentionally tested as source evidence,
 // because the command is a process entrypoint rather than an importable module.
 const plannerSource = readFileSync(new URL("./stonk-gacha.mjs", import.meta.url), "utf8");
+const protocolSource = readFileSync(new URL("./lib/protocol.mjs", import.meta.url), "utf8");
 check("planner uses Node CSPRNG", plannerSource.includes("randomBytes(32)"));
 const normalOpenPlannerSource = plannerSource.slice(
   plannerSource.indexOf("async function planOpenPack()"),
   plannerSource.indexOf("async function planOpenPackFunding()"),
 );
-check("normal funded plan-open-pack has no undefined funding intent dependency", !normalOpenPlannerSource.includes("intent.stage") && !normalOpenPlannerSource.includes("resumePreflight"));
+check("normal direct plan-open-pack has no undefined funding intent dependency", !normalOpenPlannerSource.includes("intent.stage") && !normalOpenPlannerSource.includes("resumePreflight"));
+check("normal direct pack command executes silently", normalOpenPlannerSource.includes("silentDirect: true"));
+check("normal direct pack command emits no explanatory report", !normalOpenPlannerSource.includes("const report =") && !normalOpenPlannerSource.includes("nominalRtpBps"));
+check("normal direct pack requires exact user-named price", normalOpenPlannerSource.includes("const authorizedPriceUsdc = authorizedPackPriceArg()") && normalOpenPlannerSource.includes("priceUsdc === authorizedPriceUsdc"));
+check("normal direct pack reads replay baseline", normalOpenPlannerSource.includes("SIG.requestCountOf") && normalOpenPlannerSource.includes("requestCount"));
+check("normal direct pack preserves canonical intent across approval replan", normalOpenPlannerSource.includes("--direct-intent ${directIntentHex}") && normalOpenPlannerSource.includes("--direct-intent-key ${directIntentKeyValue}"));
+check("normal direct pack does not resume from bare supplied randomness", !normalOpenPlannerSource.includes("--user-random"));
+check("verified open continues silently to the exact request claim", normalOpenPlannerSource.includes("continuation: silentPullContinuation(wallet)"));
+const claimPrizePlannerSource = plannerSource.slice(
+  plannerSource.indexOf("async function planClaimPrize()"),
+  plannerSource.indexOf("async function planExpireRequest()"),
+);
+check("standalone default claim is not silently authorized", claimPrizePlannerSource.includes('const silentDirect = suppliedContinuationHex !== undefined'));
+check("silent claim requires both continuation fields", claimPrizePlannerSource.includes("--claim-continuation and --claim-continuation-key must be supplied together"));
+check("continuation-bound claim rejects recipient and slippage overrides", claimPrizePlannerSource.includes("continuation-bound delivery cannot override recipient or slippage"));
+check("silent claim re-proves exact source open receipt", claimPrizePlannerSource.includes("await proveDirectClaimSource(directContinuation)"));
+check("silent claim omits explanatory report and warnings", claimPrizePlannerSource.includes("report: silentDirect") && claimPrizePlannerSource.includes("warnings: silentDirect ? []"));
+check("direct pull continuation is built from proven PackOpened request", plannerSource.includes("requestId: opened.requestId") && plannerSource.includes("createDirectClaimContinuation"));
+check("direct claim source proves Bankr execution and exact PackOpened request", plannerSource.includes("async function proveDirectClaimSource") && plannerSource.includes("bound PackOpened receipt request id differs from the claim continuation"));
+check("direct claim source requires hidden preimage and receipt-anchored windows", plannerSource.includes("decodeDirectPullIntent(inspection.context.terms.directPullIntent)") && plannerSource.includes("bound open receipt mined outside its direct intent validity window") && plannerSource.includes("claim continuation window is not anchored exactly to the bound open receipt"));
+check("claim inspector rechecks canonical continuation", plannerSource.includes("decodeDirectClaimContinuation(terms.directClaimContinuation)") && plannerSource.includes("direct claim continuation failed the fresh pre-signing gate"));
+check("direct pull continuation has a bounded silent wait", plannerSource.includes("maximumSilentWaitSeconds: BANKR_EXECUTION.directPull.maximumSilentWaitSeconds"));
+check("successful delivery proof returns concise result fields", plannerSource.includes("purchaseBudgetUsdcFormatted") && plannerSource.includes("recordedStockOutFormatted") && plannerSource.includes('finalTemplate: "$PURCHASE_BUDGET_USDC USDC purchase of $SYMBOL arrived."'));
+check("offer reads do not expose RTP telemetry", !protocolSource.includes("nominalRtpBps") && !protocolSource.includes("effectiveRtpBps(uint256)"));
+check("successful deployment verification emits only a summary", plannerSource.includes("deploymentIntegrity: true") && plannerSource.includes("verifiedChecks: result.checks.length") && !plannerSource.includes("out({ ok: result.ok, command, wallet, ...result }"));
 const fundedResumePlannerSource = plannerSource.slice(
   plannerSource.indexOf("async function resumeOpenPackFunding()"),
   plannerSource.indexOf("function bindXIntent()"),
 );
 check("funded resume defines its stage-specific preflight before use", fundedResumePlannerSource.indexOf("const resumePreflight") > 0 && fundedResumePlannerSource.indexOf("const resumePreflight") < fundedResumePlannerSource.indexOf("fundingBaselineRequestCount"));
+check("funded authorization does not silently widen into prize claim", !fundedResumePlannerSource.includes("continuation: silentPullContinuation"));
 check("planner rejects supplied zero randomness", plannerSource.includes("--user-random cannot be zero"));
 check("calldata inspector rejects zero randomness", plannerSource.includes("user randomness cannot be zero"));
 check("generated randomness loops until nonzero", /do value = .*randomBytes\(32\).*while \(\/\^0x0\{64\}\$\//s.test(plannerSource));
+check("every open inspection requires exactly one authorization mode", plannerSource.includes("open-pack requires a bound funded or direct one-time intent") && plannerSource.includes("cannot combine funded and direct authorization modes"));
+check("direct approval and open pre-sign gates recheck expiry and request baseline", plannerSource.includes("assessDirectPullIntent(directIntent") && plannerSource.includes("direct pull intent failed the fresh pre-signing gate"));
 equal("every plan confirmation call binds wallet", plannerSource.match(/confirmationKey\(wallet, action, terms\)/g)?.length, 2);
 check("open/fund zero reset rejects exact desired allowance", plannerSource.includes("requiresAllowanceReset(current, terms.approval.exactAmount)"));
 check("revocation inspection binds fresh current allowance", plannerSource.includes("assertContextString(current, terms.approval.currentAmount, \"fresh revocation allowance\")"));
@@ -969,6 +1196,13 @@ check("Bankr policy requires fail-on-error single call", BANKR_EXECUTION.policy.
 check("Bankr policy rejects batches and paymaster", BANKR_EXECUTION.policy.rejectWalletBatch && BANKR_EXECUTION.sponsored.account.requireEmptyPaymasterAndData);
 equal("Bankr live fixture count", BANKR_EXECUTION.sponsored.liveRegressionFixtures.length, 3);
 equal("Bankr direct live fixture count", BANKR_EXECUTION.direct.liveRegressionFixtures.length, 1);
+equal("direct pull Entropy fee cap", BigInt(BANKR_EXECUTION.directPull.maximumEntropyFeeWei), 10_000_000_000_000n);
+equal("direct pull claim slippage", BANKR_EXECUTION.directPull.claimSlippageBps, 300);
+equal("direct pull silent wait", BANKR_EXECUTION.directPull.maximumSilentWaitSeconds, 600);
+equal("direct pull intent TTL", BANKR_EXECUTION.directPull.intentTtlSeconds, 600);
+equal("direct claim continuation TTL", BANKR_EXECUTION.directPull.claimContinuationTtlSeconds, 600);
+check("direct pull policy binds price, request baseline, source receipt, and hidden capability", BANKR_EXECUTION.directPull.requireExactAuthorizedPrice && BANKR_EXECUTION.directPull.requireUnchangedRequestCountBeforeOpen && BANKR_EXECUTION.directPull.claimSource === "exact-proven-PackOpened-receipt-only" && BANKR_EXECUTION.directPull.claimCapability.includes("secret-preimage"));
+check("normal direct open enforces reviewed Entropy fee cap", normalOpenPlannerSource.includes("entropyFee <= entropyFeeCap") && plannerSource.includes("exact Entropy fee exceeds the direct pull authorization cap"));
 equal("acquisition stays structured Bankr-native", BANKR_EXECUTION.acquisition.mode, "structured-bankr-wallet-api");
 equal("local acquisition calldata is forbidden", BANKR_EXECUTION.acquisition.localSwapCalldata, "forbidden");
 equal("pack funding gets one bounded confirmation", BANKR_EXECUTION.acquisition.packFundingConfirmation, "one-bounded-confirmation-after-explicit-source-choice");
@@ -986,17 +1220,20 @@ const frontmatter = skillMarkdown.match(/^---\n([\s\S]*?)\n---(?:\n|$)/)?.[1] ??
 equal("Bankr skill name", frontmatter.match(/^name:\s*(.+)$/m)?.[1]?.trim(), "stonk-gacha");
 check("Bankr skill description exists", /^description:\s*\S.+$/m.test(frontmatter));
 check("Bankr top-level tags exist", /^tags:\s*\[[^\]]+\]$/m.test(frontmatter));
-equal("Bankr top-level version", Number(frontmatter.match(/^version:\s*(\d+)$/m)?.[1]), 2);
+equal("Bankr top-level version", Number(frontmatter.match(/^version:\s*(\d+)$/m)?.[1]), 3);
 equal("Bankr top-level visibility", frontmatter.match(/^visibility:\s*(\S+)$/m)?.[1], "public");
 equal("catalog slug", catalog.slug, "stonk-gacha");
 equal("catalog schema", catalog.schemaVersion, 1);
 equal("catalog repo path", catalog.install.repoPath, ".");
 check("catalog points at public source", catalog.install.command.includes("github.com/panikadak/stonk-gacha-bankr-skill"));
+check("catalog demonstrates one-command delivered pull", catalog.demo.code.includes("Pull me a $10") && catalog.demo.code.includes("$20 USDC purchase of GOOGLc arrived.") && !catalog.demo.code.includes("Received"));
+check("skill requires silent open-to-delivery lifecycle", skillMarkdown.includes("Keep the entire workflow silent until completion") && skillMarkdown.includes("plan-claim-prize"));
 
 for (const relative of [
   "SKILL.md", "references/operations.md", "references/bankr-execution.md",
   "references/deployment.json", "references/signing-allowlist.json", "references/bankr-execution.json",
   "references/funding-policy.json", "references/funding-fixtures.json", "references/x-confirmation.md",
+  "scripts/lib/direct.mjs",
 ]) {
   try {
     const bytes = statSync(new URL(`../${relative}`, import.meta.url)).size;

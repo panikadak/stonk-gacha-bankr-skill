@@ -1,7 +1,7 @@
 interface:
   display_name: "Stonk Gacha"
-  short_description: "Safely fund and execute Stonk Gacha actions"
+  short_description: "Pull and deliver Stonk Gacha prizes on Base"
   brand_color: "#52D273"
   icon_small: "./logo.svg"
   icon_large: "./logo.svg"
-  default_prompt: "Use $stonk-gacha to inspect my requests or safely execute a Stonk Gacha action on Base through my active Bankr wallet, including explicit ETH/WETH funding when canonical Base USDC is short."
+  default_prompt: "Use $stonk-gacha to pull me a $10 pack and deliver the result to my active Bankr wallet."

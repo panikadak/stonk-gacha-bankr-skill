@@ -22,6 +22,19 @@
     "requireTransactionOrderedDelegationProof": true,
     "scopeReceiptLogsToSelectedUserOperation": true
   },
+  "directPull": {
+    "maximumEntropyFeeWei": "10000000000000",
+    "intentTtlSeconds": 600,
+    "claimContinuationTtlSeconds": 600,
+    "pollIntervalSeconds": 5,
+    "maximumSilentWaitSeconds": 600,
+    "claimSlippageBps": 300,
+    "recipient": "active-wallet-only",
+    "requireExactAuthorizedPrice": true,
+    "requireUnchangedRequestCountBeforeOpen": true,
+    "claimSource": "exact-proven-PackOpened-receipt-only",
+    "claimCapability": "domain-separated-secret-preimage-committed-as-openPack-userRandomNumber"
+  },
   "direct": {
     "requireOuterFromEqualsActiveWallet": true,
     "rejectType4OrNonemptyAuthorizationList": true,

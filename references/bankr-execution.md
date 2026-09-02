@@ -34,7 +34,7 @@ is fail-closed; do not silently substitute remembered addresses, a frontend
 manifest, a broadcast file, explorer labels, or another RPC result after it
 fails. A deployment-pin change requires a reviewed skill update.
 
-## Plan and confirm
+## Plan and authorize
 
 Run the relevant `plan-*` command. Treat its stdout as one JSON document:
 
@@ -45,7 +45,28 @@ Run the relevant `plan-*` command. Treat its stdout as one JSON document:
   planner against fresh state;
 - `next`: the fresh read or planner step expected after success.
 
-Before the first transaction, show the user:
+For a normal pack open, a current explicit command naming one exact pack amount
+is the authorization. Pass that amount as `--authorized-price-usdc`; the
+deployed pack index must map to exactly that price. When the active wallet
+already has sufficient Base USDC and native ETH, do not show preflight,
+balances, offer details, fees, approval phases, or progress and do not ask
+again. Persist the emitted direct intent/key, submit each planner phase
+sequentially, rerun after approvals with that exact intent, and require its
+short expiry plus unchanged request-count baseline before every signature.
+The opaque intent also holds a fresh claim-capability preimage whose
+domain-separated Keccak commitment is the open's onchain user-random input;
+never expose it conversationally or accept a replacement from public data.
+
+After the open receipt proves the new request, poll that request without posting
+progress. `inspect-tx` on the successful open emits a claim continuation bound
+to the exact Bankr execution, `PackOpened` request id, wallet, source intent,
+same-wallet recipient, and 300 bps policy. When that exact request becomes
+`Ready`, pass only that continuation and key to `plan-claim-prize`. The planner
+and calldata inspector re-prove the source receipt before silent submission.
+After delivery proof, return only `$X USDC purchase of SYMBOL arrived`.
+
+For writes that are not already authorized by that direct lifecycle, present
+only the essential decision fields:
 
 - Base and the active signer;
 - the action, pack index or request id, and current contract-read amount;
@@ -55,7 +76,7 @@ Before the first transaction, show the user:
 - any irreversible reserve donation;
 - expected approval/action order and the fact that settlement is asynchronous.
 
-One explicit confirmation may cover sequential phases only while these economic
+One explicit authorization may cover sequential phases only while these economic
 terms remain unchanged. Reconfirm if the current offer, price, ceiling, token
 set, route hashes, pack/request, amount, fee, quote floor, recipient, spender,
 or irreversible effect changes. A plan context/key proves integrity, not user
@@ -89,7 +110,11 @@ an operation in `signing-allowlist.json`, canonical decoded arguments, and an
 exact recomputed binding. USDC approval must name Stonk Gacha as spender and be
 either zero or the exact fresh requirement. `openPack` alone has nonzero value,
 equal to the bound live Entropy fee; every other allowlisted operation has zero
-value. Never edit calldata to repair a mismatch.
+value. Every direct approve/open revalidates the canonical intent key, expiry,
+user-authorized price, live pack mapping, offer, ceiling, fee cap, wallet, and
+unchanged request-count baseline. Every silent claim revalidates its canonical
+continuation and re-proves the exact historical Bankr `PackOpened` receipt and
+request id. Never edit calldata to repair a mismatch.
 
 ## Submit through Bankr
 
@@ -123,7 +148,8 @@ count as native ETH.
 
 ### 1. Calculate, show, and ask
 
-Run `plan-open-pack`. When canonical Base USDC is below the current pack price,
+Run `plan-open-pack` with the exact named amount passed as
+`--authorized-price-usdc`. When canonical Base USDC is below the current pack price,
 the planner emits `choose-funding-source` with the exact raw and formatted
 deficit, Base ETH balance, Base WETH balance, live Entropy fee, and required
 native reserve.
