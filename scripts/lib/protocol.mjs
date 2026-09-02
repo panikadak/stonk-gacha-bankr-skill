@@ -424,13 +424,23 @@ export async function protocolStatus(wallet = null, snapshot = null) {
   let account = null;
   if (wallet) {
     const normalized = normalizeAddress(wallet);
-    const [usdcBalance, allowance, ethBalance, requestCount] = await Promise.all([
+    const [usdcBalance, wethBalance, allowance, ethBalance, requestCount] = await Promise.all([
       readUint(ADDR.usdc, SIG.balanceOf, ["address"], [normalized], block),
+      readUint(ADDR.weth, SIG.balanceOf, ["address"], [normalized], block),
       readUint(ADDR.usdc, SIG.allowance, ["address", "address"], [normalized, ADDR.gacha], block),
       getBalance(normalized, block),
       readUint(ADDR.gacha, SIG.requestCountOf, ["address"], [normalized], block),
     ]);
-    account = { address: normalized, usdcBalance, usdcBalanceFormatted: formatUnits(usdcBalance, 6), allowance, ethBalance, requestCount };
+    account = {
+      address: normalized,
+      usdcBalance,
+      usdcBalanceFormatted: formatUnits(usdcBalance, 6),
+      wethBalance,
+      wethBalanceFormatted: formatUnits(wethBalance, 18),
+      allowance,
+      ethBalance,
+      requestCount,
+    };
   }
   if (!snapshot) await confirmSnapshot(ownSnapshot);
   return jsonValue({

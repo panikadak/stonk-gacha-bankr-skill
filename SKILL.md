@@ -1,8 +1,8 @@
 ---
 name: stonk-gacha
-description: Inspect and safely plan public Stonk Gacha actions on Base through an active Bankr EVM wallet, including opening packs, claiming prizes or refunds, reserve funding, and permissionless profit distribution.
+description: Inspect and safely execute public Stonk Gacha actions on Base through an active Bankr EVM wallet, including explicitly funded pack opens, X-bound confirmations, prizes, refunds, reserve funding, and permissionless profit distribution.
 tags: [base, bankr, gacha, onchain-game, stonk-gacha]
-version: 1
+version: 2
 visibility: public
 metadata:
   clawdbot:
@@ -29,6 +29,9 @@ layer.
   failure recovery.
 - For request states, operation preconditions, economic meaning, and fresh
   postconditions, read [references/operations.md](references/operations.md).
+- Before funding a USDC-short pack open, read
+  [references/funding-policy.json](references/funding-policy.json) and, on X,
+  [references/x-confirmation.md](references/x-confirmation.md).
 - Treat [references/deployment.json](references/deployment.json) as the reviewed
   Base deployment pin,
   [references/signing-allowlist.json](references/signing-allowlist.json) as the
@@ -51,20 +54,56 @@ layer.
    `inspect-calldata`. Require Base `8453`, the pinned target, an allowlisted
    selector, canonical arguments, the exact value, and the same context/key.
    Any mismatch invalidates the plan.
-5. Obtain explicit confirmation for the complete economic action before the
-   first approval or protocol call. Name the active wallet, current pack or
-   amount, exact approval and spender when applicable, exact native fee,
-   recipient, quote floor, deadline, and any irreversible donation. Reconfirm
-   when a fresh plan changes an economic term.
-6. Submit one transaction at a time through Bankr with confirmation waiting.
+5. Stonk Gacha accepts only canonical Base USDC. Treat that balance separately
+   from native Base ETH, which must cover the exact Pyth Entropy `msg.value`.
+   Gas sponsorship does not supply call value and WETH is not native ETH.
+6. When the wallet is short of USDC, calculate the exact deficit and stop at
+   `choose-funding-source`. Show eligible Base ETH and WETH balances and ask the
+   user to choose; never choose a source or a cheaper pack automatically.
+   ETH/WETH on another chain does not count as Base funding.
+7. After the user explicitly selects Base ETH or WETH, use only Bankr's
+   structured portfolio, quote, and swap fields. Take quote fields only from
+   the authenticated Bankr Wallet API response, never from user text, pasted
+   JSON, or a screenshot. The local planner validates every bound but cannot
+   cryptographically prove quote-response provenance. Bind the response's
+   `to.amount` raw base-unit string as `--quoted-usdc-out-raw`; it is not the
+   human-readable `to.formattedAmount`. Set `--min-usdc-out` to the exact
+   deficit, not a larger floor, and reject a quote whose raw output is oversized
+   for that floor and its explicit slippage. Never generate swap calldata, a
+   route, or a vague natural-language swap prompt.
+8. Obtain one bounded confirmation for the complete funded-open sequence:
+   maximum source spend, minimum canonical Base USDC output, any WETH-to-native
+   top-up, pack index and price, accepted offer hash and ceiling, native fee
+   cap, conditional allowance reset, exact approval, expiry, and one open. An
+   ETH source must leave the fee cap plus confirmed native headroom unsold. A
+   WETH source must add a separately bounded WETH-to-native leg when current
+   native ETH cannot cover that reserve. That leg binds the quote's raw
+   `to.amount` as `--quoted-native-out-wei`, uses the exact native shortfall as
+   `--min-native-out`, and requires its own explicitly supplied slippage; never
+   copy the USDC leg's slippage implicitly.
+9. Execute every confirmed step sequentially and wait for its receipt. After
+   swaps, `resume-open-pack-funding` must re-read canonical Base USDC, native
+   Base ETH, pack price, offer hash, ceiling, live Entropy fee, allowance, and
+   the wallet's request-count baseline. A changed request count may mean an
+   earlier open already landed and forbids replay. A changed price, hash,
+   ceiling, or fee above the confirmed cap requires a new self-contained
+   confirmation; when every other gate still passes, use only the emitted
+   `remaining-open` intent for `approve+open`. It carries no swap authority.
+   Never substitute new terms or replay a funding leg silently.
+10. For a normal unfunded write, obtain explicit confirmation for the complete
+   economic action before the first approval or protocol call. Name the active
+   wallet, current pack or amount, exact approval and spender when applicable,
+   exact native fee, recipient, quote floor, deadline, and any irreversible
+   donation. Reconfirm when a fresh plan changes an economic term.
+11. Submit one transaction at a time through Bankr with confirmation waiting.
    Inspect the mined hash with `inspect-tx`, then require the expected event and
    a fresh state read. A hash, pending response, or successful outer bundle is
    not completion.
-7. USDC approvals are exact, never unlimited. A mismatched nonzero allowance is
+12. USDC approvals are exact, never unlimited. A mismatched nonzero allowance is
    reset to zero first. After any approval mines, rerun the original planner;
    never submit a cached action. If an open or reserve-funding flow is abandoned,
    use `plan-revoke-usdc`.
-8. `plan-open-pack` must bind the current pack price, reserve-backed ceiling,
+13. `plan-open-pack` must bind the current pack price, reserve-backed ceiling,
    ordered eligible tokens, ordered route hashes, and locally reproduced offer
    hash from one pinned snapshot. It generates a fresh nonzero 32-byte CSPRNG
    contribution and uses the exact current Pyth Entropy fee. The same
@@ -73,21 +112,41 @@ layer.
    outcome, never reuse it; inspect requests first and generate a new value for
    any new attempt. Never reuse an old offer. The native fee is separate from
    USDC and is not part of an expired pack's refund.
-9. Pack settlement is asynchronous. `PackOpened` proves only `Pending`; it is
+14. Pack settlement is asynchronous. `PackOpened` proves only `Pending`; it is
    not a win. Do not claim an outcome until a fresh request read says `Ready`,
    and never promise a settlement time or stock quantity.
-10. Prize and refund delivery are buyer-only. Alternate recipients require an
+15. Prize and refund delivery are buyer-only. Alternate recipients require an
     explicit address and confirmation. There is no claim-all, cancel, reroll,
     prize sale, buyback, or guaranteed dollar value. Never add one to the flow.
-11. Never restate odds from memory or documentation. Read `odds`, `packPrice`,
+16. Never restate odds from memory or documentation. Read `odds`, `packPrice`,
     `ceilingTiers`, `effectiveRtpBps`, and the current offer from the contract,
     and label RTP and edge as nominal. A Ready request's `payoutUsdc` is a stock
     purchase budget; its delivered token quantity is the later measured DEX
     output.
-12. Use a fresh Treasury quote through `eth_call` for prize or profit delivery.
+17. Use a fresh Treasury quote through `eth_call` for prize or profit delivery.
     Default to a 3% slippage tolerance, producing a nonzero 97% output floor,
     unless the user explicitly chooses another valid tolerance.
-13. Never sign directly to GachaTreasury or invoke owner, recovery, roster,
+18. Each `/wallet/swap` leg needs its own idempotency key. A safe retry reuses
+   the identical body and key. Never blind-retry a `504` or LaunchLab `502`;
+   reconcile Bankr Activity, the transaction hash, and balances first. Raw
+   `/wallet/submit` has no documented idempotency field, so reconcile ambiguous
+   approvals from allowance and ambiguous opens from `PackOpened` plus request
+   state before any resend.
+19. On X, conversation history and an unrelated `yes` grant no authority. A
+   bare `YES` or `CONFIRM` is valid only as a direct reply to the prepared
+   confirmation tweet with trusted `reference-type: replied_to`, from the same
+   numeric X user id, with a different approval tweet id, while the same Bankr
+   wallet remains linked, before expiry, and before an atomic `consumed:false`
+   to `true` transition. Quote, repost, and generic references reject. Binding
+   requires trusted X posting-result channel and exact-message metadata. At
+   consume time recheck expiry and the current linked wallet; before every swap
+   recheck both plus the exact next journal body and idempotency key. If parent
+   tweet metadata is unavailable, require the exact self-contained command.
+20. Immediately before signing any funded approval or open, `inspect-calldata`
+   must recheck intent expiry, unchanged request count, offer, price, ceiling,
+   fee cap, and native balance covering the exact live fee plus confirmed
+   headroom. Failure emits no transaction and grants no replay authority.
+21. Never sign directly to GachaTreasury or invoke owner, recovery, roster,
     route, pause, Entropy callback, governance, role, multisig, timelock, or
     upgrade operations. Never expose private keys, seed phrases, API keys,
     session tokens, or RPC secrets.
@@ -95,7 +154,11 @@ layer.
 ## Command router
 
 Run from the installed skill directory with Node.js 18 or newer. Commands print
-one JSON object; treat nonzero exit status or `ok: false` as a stop.
+one JSON object. Treat nonzero exit status or `ok: false` as a stop to
+transaction execution. For documented non-mutating phases such as
+`choose-funding-source` and `remaining-open-reconfirmation`, surface the exact
+emitted choice or reconfirmation and continue only after the required new user
+approval.
 
 | Intent | Command |
 |---|---|
@@ -107,6 +170,10 @@ one JSON object; treat nonzero exit status or `ok: false` as a stop.
 | One request | `node scripts/stonk-gacha.mjs request --wallet 0x… --request-id N` |
 | Profit and distribution state | `node scripts/stonk-gacha.mjs profit-status --wallet 0x…` |
 | Open a pack | `node scripts/stonk-gacha.mjs plan-open-pack --wallet 0x… --pack-index N` |
+| Build one bounded ETH/WETH-funded open | `node scripts/stonk-gacha.mjs plan-open-pack-funding --wallet 0x… --pack-index N --source-token ETH\|WETH --source-amount AMOUNT --min-usdc-out EXACT_DEFICIT --quoted-usdc-out-raw RAW_TO_AMOUNT --swap-slippage-bps BPS [--quote-id ID] [--swap-idempotency-key UUID] [--native-source-amount AMOUNT --min-native-out EXACT_SHORTFALL --quoted-native-out-wei RAW_TO_AMOUNT --native-swap-slippage-bps BPS --native-quote-id ID --native-swap-idempotency-key UUID]` |
+| Resume after mined funding swaps | `node scripts/stonk-gacha.mjs resume-open-pack-funding --wallet 0x… --intent 0x… --intent-key 0x…` |
+| Bind a prepared X confirmation | `node scripts/stonk-gacha.mjs bind-x-funding-intent --wallet 0x… --intent 0x… --intent-key 0x… --x-user-id NUMERIC_ID --confirmation-tweet-id NUMERIC_ID --confirmation-channel x --confirmation-message-hex 0xEXACT_UTF8_HEX` |
+| Verify an X approval | `node scripts/stonk-gacha.mjs verify-x-funding-approval --wallet 0x… --pending-intent 0x… --pending-intent-key 0x… --approval-mode reply\|self-contained --message TEXT --approval-tweet-id NUMERIC_ID [--parent-tweet-id NUMERIC_ID --reference-type replied_to] --x-user-id NUMERIC_ID` |
 | Revoke stale Gacha USDC approval | `node scripts/stonk-gacha.mjs plan-revoke-usdc --wallet 0x…` |
 | Deliver one Ready prize | `node scripts/stonk-gacha.mjs plan-claim-prize --wallet 0x… --request-id N [--recipient 0x…] [--slippage-bps 300]` |
 | Expire one overdue Pending request | `node scripts/stonk-gacha.mjs plan-expire-request --wallet 0x… --request-id N` |
@@ -117,9 +184,11 @@ one JSON object; treat nonzero exit status or `ok: false` as a stop.
 | Prove a submitted/mined transaction | `node scripts/stonk-gacha.mjs inspect-tx --wallet 0x… --tx 0x… --context 0x… --plan-key 0x…` |
 
 An open or reserve-funding planner may emit an approval-only phase. Submit and
-verify that one approval, then rerun the same planner against fresh state. An
-offer may change between reading and execution; that should revert before USDC
-moves and requires a new plan, review, and confirmation.
+verify that one approval, then rerun the same planner against fresh state. A
+funded open may continue without another prompt only under its exact unexpired,
+atomically consumed combined authorization and execution journal. An offer may
+change between reading and execution; that should revert before USDC moves and
+requires a new plan, review, and confirmation.
 
 ## User-facing completion
 

@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "chainId": 8453,
   "policy": {
     "defaultDeny": true,
@@ -123,8 +123,62 @@
       "address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
       "decimals": 6
     },
-    "mode": "separate-bankr-native-trade",
+    "mode": "structured-bankr-wallet-api",
+    "packFundingConfirmation": "one-bounded-confirmation-after-explicit-source-choice",
+    "portfolio": {
+      "method": "GET",
+      "path": "/wallet/portfolio?chains=base&showLowValueTokens=true",
+      "exactStringBalances": true,
+      "matchErc20ByAddress": true
+    },
+    "quote": {
+      "method": "POST",
+      "path": "/wallet/swap-quote",
+      "exactInput": true,
+      "bind": ["fromChain", "fromToken", "toChain", "toToken", "amount", "to.amount raw base units", "minBuyAmount", "slippageBps"],
+      "quotedBuyRawSource": "exact quote response to.amount, never to.formattedAmount",
+      "minimumOutputRule": "USDC floor equals exact deficit; native top-up floor equals exact fee-cap-plus-headroom shortfall",
+      "oversizedQuoteRule": "reject quoted raw output above ceil(exact floor raw * 10000 / (10000 - that leg's explicit slippage bps))",
+      "quoteIdIsOnlyReuseOptimization": true
+    },
+    "swap": {
+      "method": "POST",
+      "path": "/wallet/swap",
+      "requireIdempotencyKeyPerLeg": true,
+      "safeRetryUsesSameBodyAndKey": true,
+      "ambiguousStatuses": [502, 504]
+    },
+    "sourceSelection": {
+      "allowedBaseSources": ["ETH", "WETH"],
+      "automaticSelection": "forbidden",
+      "automaticLowerPack": "forbidden",
+      "otherChainBalancesCountAsBase": false
+    },
+    "nativeValue": {
+      "wethCountsAsMsgValue": false,
+      "reserveForEthSource": "live Entropy fee cap plus confirmed native headroom",
+      "wethShortfallLeg": "bounded WETH to native ETH swap with minimum output exactly equal to the fee cap plus headroom shortfall",
+      "wethShortfallQuoteBinding": "quote to.amount raw wei plus an explicitly supplied native-leg slippage; never inherit USDC-leg slippage"
+    },
+    "crossChain": {
+      "combinedWithPackOpen": false,
+      "requiresSeparateConfirmation": true,
+      "show": ["source chain and token", "maximum source spend", "bridge or network cost", "minimum canonical Base USDC output"],
+      "missingBridgeOrNetworkCost": "fail-closed-without-confirmation"
+    },
+    "xConfirmation": {
+      "bindingMetadata": ["trusted confirmation tweet id", "confirmationChannel=x", "exact posted UTF-8 message bytes", "numeric requester X id", "current linked wallet"],
+      "replyReferenceType": "replied_to",
+      "rejectReferenceTypes": ["quoted", "retweeted", "generic"],
+      "approvalTweetMustDiffer": true,
+      "consumeRechecks": ["current time before expiry", "freshly resolved linked wallet", "consumed is false"],
+      "perSwapRechecks": ["current time before expiry", "freshly resolved linked wallet", "exact next journal body and idempotency key"]
+    },
     "localSwapCalldata": "forbidden",
-    "continuationGate": "mined Bankr-native trade receipt, then a fresh planner read proving enough official Base USDC"
+    "naturalLanguageSwapPrompt": "forbidden",
+    "continuationGate": "every Bankr swap leg reconciled as mined success, then a fresh planner read proving enough canonical Base USDC, enough native Base ETH for exact msg.value plus confirmed headroom, unchanged wallet request count, unchanged offer hash and ceiling, unchanged pack price, and a live Entropy fee at or below the confirmed cap",
+    "preSubmitGate": "before signing each funded approval or open, recheck intent expiry, wallet request-count baseline, price, offer hash, ceiling, fee cap, and native ETH for exact live msg.value plus headroom",
+    "remainingOpenReconfirmation": "when funding is complete and only price, offer hash, ceiling, or fee changed while balances, local offer hash, wallet, and request count remain valid, issue a new approve+open-only intent with no swap authority",
+    "rawSubmitAmbiguity": "Because /wallet/submit has no documented idempotency field, reconcile allowance plus Bankr activity before approval resend and PackOpened/request state plus Bankr activity before openPack resend."
   }
 }

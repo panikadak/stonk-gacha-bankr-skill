@@ -1,9 +1,10 @@
 # Stonk Gacha Bankr Skill
 
 A deterministic, fail-closed Bankr skill for the live Stonk Gacha deployment on
-Base. It reads current offers and request state, plans the public user and worker
-operations, produces unsigned transactions, and verifies submitted receipts.
-It never stores keys, signs, or broadcasts.
+Base. Version 2 adds bounded Base ETH/WETH-to-USDC funding and replay-resistant
+X confirmations to the existing current-offer, request, planner, and receipt
+flows. The scripts never store keys, sign, broadcast, or manufacture swap
+calldata.
 
 ## Install in Bankr
 
@@ -23,6 +24,8 @@ reference](https://docs.bankr.bot/skills/in-bankr/skill-format/).
 ## Safety model
 
 - Base only (`chainId: 8453`).
+- Pack charges use canonical Base USDC only. Native Base ETH separately funds
+  the exact Pyth Entropy `msg.value`; WETH and gas sponsorship do not replace it.
 - Deployment runtime hashes, immutable wiring, and protocol terms are verified
   before planning.
 - Related reads are pinned to one canonical block.
@@ -32,13 +35,80 @@ reference](https://docs.bankr.bot/skills/in-bankr/skill-format/).
   independently inspected.
 - Current offers, sales state, Entropy fee, odds, quotes, and profit are read
   live. They are never treated as repository constants.
+- A USDC-short open reports the exact deficit and asks the user to choose Base
+  ETH or WETH. It never auto-selects a token or lowers the pack.
+- After source choice, one bounded confirmation can cover the listed Bankr
+  swap leg(s), conditional allowance reset, exact USDC approval, and one open.
+  Fresh post-swap reads invalidate that authority if the price, offer hash,
+  ceiling, fee cap, or wallet request-count baseline no longer matches.
+- X approvals bind the direct parent tweet, numeric X identity, linked wallet,
+  exact posted text/channel, exact economic intent, expiry, and an atomic
+  one-time consume transition.
 - No direct Treasury, owner, recovery, pause, callback, roster, route,
   governance, role, multisig, timelock, or upgrade transaction is permitted.
 
 Read [SKILL.md](SKILL.md) for the agent workflow,
 [references/operations.md](references/operations.md) for protocol behavior, and
 [references/bankr-execution.md](references/bankr-execution.md) for execution and
-receipt rules.
+receipt rules. X runtimes must also follow
+[references/x-confirmation.md](references/x-confirmation.md).
+
+## Funded pack open
+
+Start with the ordinary planner:
+
+```bash
+node scripts/stonk-gacha.mjs plan-open-pack \
+  --wallet 0xYourActiveBankrEvmWallet \
+  --pack-index 1
+```
+
+If canonical Base USDC is short, it returns `choose-funding-source` with the
+exact deficit and separate Base ETH/WETH/native-fee state. Show those choices
+and wait for the user to name ETH or WETH. Then obtain a structured
+[`/wallet/swap-quote`](https://docs.bankr.bot/wallet-api/swap/) sized only for
+the deficit from the authenticated Bankr runtime and pass the exact quote
+bounds into `plan-open-pack-funding`; never source them from user text, pasted
+JSON, or a screenshot. The local planner validates the bounds but cannot
+cryptographically authenticate quote provenance.
+Bankr's quote response uses
+`to.amount` for the buy amount in raw base units; pass that exact string as
+`--quoted-usdc-out-raw`, not `to.formattedAmount`. `--min-usdc-out` must equal
+the exact deficit. The planner rejects a quote whose raw output is below that
+floor or oversized relative to the exact floor and explicit slippage. The
+emitted intent contains the ordered `/wallet/swap` request body or bodies and
+one complete confirmation.
+
+An ETH source leaves the confirmed Entropy fee cap plus native headroom unsold.
+A WETH source with insufficient native ETH includes a separately bounded
+WETH-to-native top-up before WETH-to-USDC. That quote's raw `to.amount` becomes
+`--quoted-native-out-wei`, `--min-native-out` equals the exact fee-plus-headroom
+shortfall, and `--native-swap-slippage-bps` is mandatory and independent; it is
+never copied from the USDC leg. Other-chain ETH/WETH requires a separate
+bridge/acquisition confirmation showing source chain, maximum spend, known
+bridge/network cost, and minimum canonical Base USDC output. If the cost is
+unavailable, fail closed and do not ask for confirmation. A cross-chain action
+never inherits the pack-open authorization.
+
+Execute each confirmed leg sequentially and preserve its idempotency key. Do
+not blind-retry a `504` or LaunchLab `502`. After the swaps mine, run the
+emitted `resume-open-pack-funding` command so the skill can re-read balances,
+offer, ceiling, price, fee, allowance, and the wallet request-count baseline
+before any approval or open. Immediately before each funded approval/open,
+`inspect-calldata` rechecks intent expiry, that request baseline, and native ETH
+covering the live fee plus headroom. Before every swap, the runtime rechecks
+expiry, current linked wallet, and the exact next execution-journal step.
+If funding is complete but only pack economics changed, the planner can issue a
+new `do=approve+open` confirmation with no swap authority; the original funding
+legs are never replayed.
+
+The consent model follows Bankr's published [Hunch funding
+pattern](https://github.com/BankrBot/skills/blob/main/hunch/SKILL.md#L340-L367),
+[Cat Town native-fee preflight](https://github.com/BankrBot/skills/blob/main/cattown/SKILL.md#L542-L560),
+[Aero Stock LP sequence confirmation](https://github.com/BankrBot/skills/blob/main/aero-stock-lp/SKILL.md#L52-L66),
+and [HoodMarkets X auth
+boundary](https://github.com/BankrBot/skills/blob/main/hoodmarkets/references/AUTH-BOUNDARY.md),
+specialized for Stonk Gacha's exact USDC and Entropy constraints.
 
 ## Local validation
 

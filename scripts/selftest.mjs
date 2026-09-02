@@ -57,6 +57,23 @@ import {
 } from "./lib/chain.mjs";
 import { eventTopic, keccak256, selector } from "./lib/keccak256.mjs";
 import {
+  DEFAULT_NATIVE_HEADROOM_WEI,
+  FUNDING_POLICY,
+  NATIVE_SENTINEL,
+  bindXFundingIntent,
+  createFundingIntent,
+  decodeFundingIntent,
+  encodeFundingIntent,
+  fundingIntentKey,
+  fundingResumeAssessment,
+  fundingSourceOptions,
+  rebaseFundingIntentForRemainingOpen,
+  verifyXFundingApproval,
+  xPendingIntentKey,
+  xPreparedConfirmation,
+  xSelfContainedCommand,
+} from "./lib/funding.mjs";
+import {
   ADDR,
   ALLOWED_ACTIONS,
   BANKR_EXECUTION,
@@ -80,6 +97,7 @@ import {
 
 const LIVE = process.argv.includes("--live");
 const results = [];
+const FUNDING_FIXTURES = JSON.parse(readFileSync(new URL("../references/funding-fixtures.json", import.meta.url), "utf8"));
 
 function check(name, pass, detail = "") {
   results.push({ status: pass ? "pass" : "fail", name, detail: pass ? "" : String(detail || "assertion was false") });
@@ -355,6 +373,16 @@ rejects("reset predicate rejects nonpositive desired allowance", () => requiresA
 // because the command is a process entrypoint rather than an importable module.
 const plannerSource = readFileSync(new URL("./stonk-gacha.mjs", import.meta.url), "utf8");
 check("planner uses Node CSPRNG", plannerSource.includes("randomBytes(32)"));
+const normalOpenPlannerSource = plannerSource.slice(
+  plannerSource.indexOf("async function planOpenPack()"),
+  plannerSource.indexOf("async function planOpenPackFunding()"),
+);
+check("normal funded plan-open-pack has no undefined funding intent dependency", !normalOpenPlannerSource.includes("intent.stage") && !normalOpenPlannerSource.includes("resumePreflight"));
+const fundedResumePlannerSource = plannerSource.slice(
+  plannerSource.indexOf("async function resumeOpenPackFunding()"),
+  plannerSource.indexOf("function bindXIntent()"),
+);
+check("funded resume defines its stage-specific preflight before use", fundedResumePlannerSource.indexOf("const resumePreflight") > 0 && fundedResumePlannerSource.indexOf("const resumePreflight") < fundedResumePlannerSource.indexOf("fundingBaselineRequestCount"));
 check("planner rejects supplied zero randomness", plannerSource.includes("--user-random cannot be zero"));
 check("calldata inspector rejects zero randomness", plannerSource.includes("user randomness cannot be zero"));
 check("generated randomness loops until nonzero", /do value = .*randomBytes\(32\).*while \(\/\^0x0\{64\}\$\//s.test(plannerSource));
@@ -374,6 +402,302 @@ check("planner does not overclaim arbitrary prize-token Transfer proof", !planne
 const sampledRandom = `0x${randomBytes(32).toString("hex")}`;
 check("test runtime produces a 32-byte CSPRNG sample", /^0x[0-9a-f]{64}$/.test(sampledRandom));
 check("zero is outside valid buyer-random domain", !/^0x0{64}$/.test(userRandom) && /^0x0{64}$/.test(`0x${"0".repeat(64)}`));
+
+// Funding is a structured Bankr-native layer around the protocol planner. It
+// never adds a swap target to the raw-call allowlist and every economic bound
+// is carried in a canonical, wallet-specific intent.
+const fundingFixture = FUNDING_FIXTURES.baseWethWithNativeTopUp;
+const fundingCreatedAt = 1_788_345_000n;
+const fundingExpiresAt = fundingCreatedAt + 600n;
+const baseWethFundingParams = {
+  wallet,
+  packIndex: fundingFixture.packIndex,
+  packPriceUsdc: BigInt(fundingFixture.packPriceUsdcRaw),
+  usdcBalance: BigInt(fundingFixture.baseUsdcRaw),
+  ethBalance: BigInt(fundingFixture.baseEthWei),
+  wethBalance: BigInt(fundingFixture.baseWethWei),
+  allowance: 0n,
+  requestCount: 7n,
+  spender: ADDR.gacha,
+  expectedOfferHash: sampleHash,
+  acceptedCeilingBps: 40_000n,
+  entropyFeeWei: BigInt(fundingFixture.entropyFeeWei),
+  nativeHeadroomWei: BigInt(fundingFixture.nativeHeadroomWei),
+  sourceToken: "WETH",
+  sourceAmountRaw: parseUnits(fundingFixture.usdcQuote.from.amount, 18),
+  minUsdcOutRaw: parseUnits(fundingFixture.usdcQuote.minBuyAmount, 6),
+  quotedUsdcOutRaw: BigInt(fundingFixture.usdcQuote.to.amount),
+  swapSlippageBps: fundingFixture.usdcQuote.slippageBps,
+  quoteId: fundingFixture.usdcQuote.quoteId,
+  swapIdempotencyKey: fundingFixture.swapIdempotencyKey,
+  nativeSourceAmountRaw: parseUnits(fundingFixture.nativeQuote.from.amount, 18),
+  minNativeOutWei: parseUnits(fundingFixture.nativeQuote.minBuyAmount, 18),
+  quotedNativeOutWei: BigInt(fundingFixture.nativeQuote.to.amount),
+  nativeSwapSlippageBps: fundingFixture.nativeQuote.slippageBps,
+  nativeQuoteId: fundingFixture.nativeQuote.quoteId,
+  nativeSwapIdempotencyKey: fundingFixture.nativeSwapIdempotencyKey,
+  userRandomNumber: userRandom,
+  createdAt: fundingCreatedAt,
+  expiresAt: fundingExpiresAt,
+};
+const makeWethFundingIntent = (overrides = {}) => createFundingIntent({ ...baseWethFundingParams, ...overrides });
+const wethFundingIntent = makeWethFundingIntent();
+
+equal("funding policy chain", FUNDING_POLICY.network.chainId, 8453);
+equal("funding policy canonical USDC", normalizeAddress(FUNDING_POLICY.canonicalAssets.usdc.address), ADDR.usdc);
+equal("funding policy canonical WETH", normalizeAddress(FUNDING_POLICY.canonicalAssets.weth.address), ADDR.weth);
+equal("funding policy native sentinel", NATIVE_SENTINEL, "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+equal("funding policy native headroom", DEFAULT_NATIVE_HEADROOM_WEI, 1_500_000_000_000_000n);
+check("funding policy forbids automatic source", !FUNDING_POLICY.combinedOpen.allowAutomaticSourceSelection);
+check("funding policy forbids automatic pack downgrade", !FUNDING_POLICY.combinedOpen.allowAutomaticPackDowngrade);
+check("funding policy forbids swap calldata and vague prompts", !FUNDING_POLICY.combinedOpen.allowSwapCalldata && !FUNDING_POLICY.combinedOpen.allowNaturalLanguageSwapPrompt);
+check("cross-chain never counts as Base balance", !FUNDING_POLICY.crossChain.countsAsBaseBalance && FUNDING_POLICY.crossChain.requiresSeparateConfirmation);
+equal("cross-chain confirmation fails closed without visible cost", FUNDING_POLICY.crossChain.missingNetworkOrBridgeCost, "fail-closed-without-confirmation");
+
+const sourceOptions = fundingSourceOptions({
+  usdcBalance: 2_000_000n,
+  packPriceUsdc: 10_000_000n,
+  ethBalance: 0n,
+  wethBalance: 1_000_000_000_000_000_000n,
+  entropyFeeWei: 100_000_000_000_000n,
+});
+equal("funding source exact deficit", sourceOptions.exactDeficitUsdcRaw, "8000000");
+deepEqual("funding source asks both explicit choices", sourceOptions.choices.map((entry) => entry.sourceToken), ["ETH", "WETH"]);
+check("zero native ETH makes ETH ineligible", !sourceOptions.choices[0].eligible);
+check("WETH remains separate from native msg.value", sourceOptions.choices[1].eligible && sourceOptions.choices[1].nativeTopUpRequired);
+equal("WETH native top-up covers fee plus headroom", sourceOptions.choices[1].minimumNativeTopUpWei, "1600000000000000");
+
+equal("WETH funding intent kind", wethFundingIntent.kind, "stonk-gacha-funded-open/v1");
+equal("WETH funding exact deficit", wethFundingIntent.preflight.exactDeficitUsdcRaw, "8000000");
+deepEqual("WETH zero-native flow has ordered two legs", wethFundingIntent.fundingLegs.map((entry) => entry.purpose), ["native-top-up", "usdc-deficit"]);
+equal("WETH aggregate maximum includes both legs", wethFundingIntent.source.aggregateMaximumInputRaw, "6000000000000000");
+equal("USDC leg targets canonical Base USDC", wethFundingIntent.fundingLegs[1].toToken, ADDR.usdc);
+equal("native leg targets Bankr native sentinel", wethFundingIntent.fundingLegs[0].toToken, NATIVE_SENTINEL);
+equal("Bankr funding uses structured swap endpoint", wethFundingIntent.fundingLegs[1].bankr.path, "/wallet/swap");
+equal("Bankr funding binds exact source amount", wethFundingIntent.fundingLegs[1].bankr.body.amount, fundingFixture.usdcQuote.from.amount);
+equal("Bankr funding binds USDC floor", wethFundingIntent.fundingLegs[1].bankr.body.minBuyAmount, fundingFixture.usdcQuote.minBuyAmount);
+equal("Bankr funding persists swap idempotency", wethFundingIntent.fundingLegs[1].bankr.body.idempotencyKey, fundingFixture.swapIdempotencyKey);
+check("funding intent contains no route or calldata", !/(calldata|route)/i.test(JSON.stringify(wethFundingIntent)));
+
+const encodedWethIntent = encodeFundingIntent(wethFundingIntent);
+deepEqual("funding intent canonical hex round trip", decodeFundingIntent(encodedWethIntent), wethFundingIntent);
+equal("funding intent key survives round trip", fundingIntentKey(decodeFundingIntent(encodedWethIntent)), fundingIntentKey(wethFundingIntent));
+rejects("funding floor below exact deficit", () => makeWethFundingIntent({ minUsdcOutRaw: 7_999_999n }), "must equal the exact required deficit");
+rejects("funding floor above exact deficit", () => makeWethFundingIntent({ minUsdcOutRaw: 8_000_001n }), "must equal the exact required deficit");
+rejects("oversized USDC quote is rejected", () => makeWethFundingIntent({ quotedUsdcOutRaw: 8_247_424n }), "quote is oversized");
+rejects("funding intent rejects unsafe native headroom", () => makeWethFundingIntent({ nativeHeadroomWei: DEFAULT_NATIVE_HEADROOM_WEI - 1n }), "outside policy bounds");
+rejects("WETH zero-native flow cannot omit native leg", () => makeWethFundingIntent({ nativeSourceAmountRaw: null, minNativeOutWei: null, quotedNativeOutWei: null, nativeSwapSlippageBps: null, nativeSwapIdempotencyKey: null, nativeQuoteId: null }), "requires a native top-up leg");
+rejects("native top-up floor must equal the exact shortfall", () => makeWethFundingIntent({ minNativeOutWei: 1_600_000_000_000_001n }), "must equal the exact required deficit or shortfall");
+rejects("oversized native top-up quote is rejected", () => makeWethFundingIntent({ quotedNativeOutWei: 1_700_000_000_000_000n }), "quote is oversized");
+rejects("WETH aggregate spend cannot exceed balance", () => makeWethFundingIntent({ wethBalance: 5_999_999_999_999_999n }), "exceed the pinned Base WETH balance");
+rejects("funding swap legs require different idempotency keys", () => makeWethFundingIntent({ nativeSwapIdempotencyKey: fundingFixture.swapIdempotencyKey }), "distinct idempotency keys");
+const crossChainTamper = JSON.parse(JSON.stringify(wethFundingIntent));
+crossChainTamper.fundingLegs[1].fromChain = "mainnet";
+crossChainTamper.fundingLegs[1].bankr.body.fromChain = "mainnet";
+rejects("combined funding rejects other-chain source", () => fundingIntentKey(crossChainTamper), "must stay on Base");
+const routeTamper = JSON.parse(JSON.stringify(wethFundingIntent));
+routeTamper.fundingLegs[1].route = "untrusted-route";
+rejects("funding intent rejects injected route field", () => fundingIntentKey(routeTamper), "unsupported field route");
+const calldataTamper = JSON.parse(JSON.stringify(wethFundingIntent));
+calldataTamper.fundingLegs[1].bankr.body.calldata = "0xdeadbeef";
+rejects("funding intent rejects injected swap calldata", () => fundingIntentKey(calldataTamper), "unsupported field calldata");
+
+const baseEthFundingParams = {
+  ...baseWethFundingParams,
+  ethBalance: 1_000_000_000_000_000_000n,
+  sourceToken: "ETH",
+  sourceAmountRaw: 4_000_000_000_000_000n,
+  nativeSourceAmountRaw: null,
+  minNativeOutWei: null,
+  quotedNativeOutWei: null,
+  nativeSwapSlippageBps: null,
+  nativeQuoteId: null,
+  nativeSwapIdempotencyKey: null,
+};
+const makeEthFundingIntent = (overrides = {}) => createFundingIntent({ ...baseEthFundingParams, ...overrides });
+const ethFundingIntent = makeEthFundingIntent();
+equal("ETH funding intent has one leg", ethFundingIntent.fundingLegs.length, 1);
+equal("ETH funding leg uses native sentinel", ethFundingIntent.fundingLegs[0].fromToken, NATIVE_SENTINEL);
+rejects("ETH source cannot spend fee cap or headroom", () => makeEthFundingIntent({ sourceAmountRaw: 999_000_000_000_000_000n }), "would spend the Entropy fee cap or native headroom");
+rejects("ETH source cannot smuggle a WETH top-up", () => makeEthFundingIntent({ nativeSourceAmountRaw: 1n, minNativeOutWei: 1n, quotedNativeOutWei: 1n, nativeSwapSlippageBps: 300, nativeSwapIdempotencyKey: fundingFixture.nativeSwapIdempotencyKey }), "cannot include a WETH native-top-up leg");
+
+const baseEthKey = fundingIntentKey(ethFundingIntent);
+check("intent key changes with wallet", fundingIntentKey(makeEthFundingIntent({ wallet: otherWallet })) !== baseEthKey);
+check("intent key changes with source maximum", fundingIntentKey(makeEthFundingIntent({ sourceAmountRaw: 4_100_000_000_000_000n })) !== baseEthKey);
+check("intent key changes with exact minimum USDC output", fundingIntentKey(makeEthFundingIntent({
+  usdcBalance: 1_900_000n,
+  minUsdcOutRaw: 8_100_000n,
+  quotedUsdcOutRaw: 8_200_000n,
+})) !== baseEthKey);
+check("intent key changes with offer hash", fundingIntentKey(makeEthFundingIntent({ expectedOfferHash: keccak256("other-funding-offer") })) !== baseEthKey);
+check("intent key changes with ceiling", fundingIntentKey(makeEthFundingIntent({ acceptedCeilingBps: 50_000n })) !== baseEthKey);
+check("intent key changes with fee cap", fundingIntentKey(makeEthFundingIntent({ entropyFeeWei: 100_000_000_000_001n })) !== baseEthKey);
+check("intent key changes with expiry", fundingIntentKey(makeEthFundingIntent({ expiresAt: fundingExpiresAt + 1n })) !== baseEthKey);
+check("intent key changes with pack", fundingIntentKey(makeEthFundingIntent({
+  packIndex: 2,
+  packPriceUsdc: 20_000_000n,
+  minUsdcOutRaw: 18_000_000n,
+  quotedUsdcOutRaw: 18_100_000n,
+})) !== baseEthKey);
+
+const liveFundingState = {
+  wallet,
+  packIndex: ethFundingIntent.pack.packIndex,
+  timestamp: fundingCreatedAt + 100n,
+  salesPaused: false,
+  packPriceUsdc: BigInt(ethFundingIntent.pack.priceUsdcRaw),
+  offerHash: ethFundingIntent.pack.expectedOfferHash,
+  computedOfferHash: ethFundingIntent.pack.expectedOfferHash,
+  ceilingBps: BigInt(ethFundingIntent.pack.acceptedCeilingBps),
+  entropyFeeWei: BigInt(ethFundingIntent.pack.entropyFeeCapWei),
+  usdcBalance: BigInt(ethFundingIntent.pack.priceUsdcRaw),
+  ethBalance: BigInt(ethFundingIntent.pack.entropyFeeCapWei) + BigInt(ethFundingIntent.preflight.nativeHeadroomWei),
+  walletRequestCount: BigInt(ethFundingIntent.preflight.walletRequestCount),
+};
+check("unchanged post-swap state can resume", fundingResumeAssessment(ethFundingIntent, liveFundingState).ok);
+const changedOfferAssessment = fundingResumeAssessment(ethFundingIntent, { ...liveFundingState, offerHash: keccak256("changed-after-swap") });
+check("changed offer requires self-contained reconfirmation", !changedOfferAssessment.ok && changedOfferAssessment.reconfirmationRequired);
+const changedCeilingAssessment = fundingResumeAssessment(ethFundingIntent, { ...liveFundingState, ceilingBps: BigInt(ethFundingIntent.pack.acceptedCeilingBps) + 1n });
+check("changed ceiling requires reconfirmation", changedCeilingAssessment.reconfirmationRequired);
+const feeCapAssessment = fundingResumeAssessment(ethFundingIntent, { ...liveFundingState, entropyFeeWei: BigInt(ethFundingIntent.pack.entropyFeeCapWei) + 1n, ethBalance: 1_000_000_000_000_000_000n });
+check("fee above cap requires reconfirmation", feeCapAssessment.reconfirmationRequired);
+const stillShortAssessment = fundingResumeAssessment(ethFundingIntent, { ...liveFundingState, usdcBalance: 9_999_999n });
+check("still-short USDC stops without silently changing terms", !stillShortAssessment.ok && !stillShortAssessment.reconfirmationRequired);
+const depletedHeadroomAssessment = fundingResumeAssessment(ethFundingIntent, { ...liveFundingState, ethBalance: BigInt(ethFundingIntent.pack.entropyFeeCapWei) });
+check("post-swap resume preserves native fee headroom", !depletedHeadroomAssessment.ok && !depletedHeadroomAssessment.reconfirmationRequired);
+const changedRequestCountAssessment = fundingResumeAssessment(ethFundingIntent, { ...liveFundingState, walletRequestCount: BigInt(ethFundingIntent.preflight.walletRequestCount) + 1n });
+check("changed request count prevents funded-open replay", !changedRequestCountAssessment.ok && changedRequestCountAssessment.reconfirmationRequired);
+const remainingOfferHash = keccak256("remaining-open-offer");
+const remainingOpenIntent = rebaseFundingIntentForRemainingOpen(ethFundingIntent, {
+  packPriceUsdc: BigInt(ethFundingIntent.pack.priceUsdcRaw),
+  expectedOfferHash: remainingOfferHash,
+  acceptedCeilingBps: BigInt(ethFundingIntent.pack.acceptedCeilingBps) + 1n,
+  entropyFeeWei: BigInt(ethFundingIntent.pack.entropyFeeCapWei) + 1n,
+  usdcBalance: BigInt(ethFundingIntent.pack.priceUsdcRaw),
+  ethBalance: BigInt(ethFundingIntent.pack.entropyFeeCapWei) + 1n + BigInt(ethFundingIntent.preflight.nativeHeadroomWei),
+  allowance: 0n,
+  requestCount: BigInt(ethFundingIntent.preflight.walletRequestCount),
+  createdAt: fundingCreatedAt + 101n,
+  expiresAt: fundingCreatedAt + 701n,
+});
+equal("remaining-open reconfirmation has an explicit stage", remainingOpenIntent.stage, "remaining-open");
+check("remaining-open reconfirmation gets a new economic key", fundingIntentKey(remainingOpenIntent) !== baseEthKey);
+check("remaining-open intent carries no executable funding authority", !Object.hasOwn(remainingOpenIntent, "fundingLegs") && !Object.hasOwn(remainingOpenIntent, "source") && !Object.hasOwn(remainingOpenIntent, "minimumBaseUsdcOutputRaw") && !/(\/wallet\/swap|idempotencyKey|"bankr":)/i.test(JSON.stringify(remainingOpenIntent)));
+check("remaining-open X confirmation authorizes no swap replay", xPreparedConfirmation(remainingOpenIntent).includes("do=approve+open") && !xPreparedConfirmation(remainingOpenIntent).includes("do=swap+approve+open"));
+deepEqual("remaining-open intent canonical hex round trip", decodeFundingIntent(encodeFundingIntent(remainingOpenIntent)), remainingOpenIntent);
+check("fresh remaining-open terms can resume after reconfirmation", fundingResumeAssessment(remainingOpenIntent, {
+  ...liveFundingState,
+  timestamp: fundingCreatedAt + 102n,
+  offerHash: remainingOfferHash,
+  computedOfferHash: remainingOfferHash,
+  ceilingBps: BigInt(remainingOpenIntent.pack.acceptedCeilingBps),
+  entropyFeeWei: BigInt(remainingOpenIntent.pack.entropyFeeCapWei),
+  ethBalance: BigInt(remainingOpenIntent.remainingPreflight.baseEthWei),
+  walletRequestCount: BigInt(remainingOpenIntent.remainingPreflight.walletRequestCount),
+}).ok);
+rejects("remaining-open reconfirmation cannot cross request replay evidence", () => rebaseFundingIntentForRemainingOpen(ethFundingIntent, {
+  packPriceUsdc: BigInt(ethFundingIntent.pack.priceUsdcRaw),
+  expectedOfferHash: remainingOfferHash,
+  acceptedCeilingBps: BigInt(ethFundingIntent.pack.acceptedCeilingBps),
+  entropyFeeWei: BigInt(ethFundingIntent.pack.entropyFeeCapWei),
+  usdcBalance: BigInt(ethFundingIntent.pack.priceUsdcRaw),
+  ethBalance: BigInt(ethFundingIntent.pack.entropyFeeCapWei) + BigInt(ethFundingIntent.preflight.nativeHeadroomWei),
+  allowance: 0n,
+  requestCount: BigInt(ethFundingIntent.preflight.walletRequestCount) + 1n,
+  createdAt: fundingCreatedAt + 101n,
+  expiresAt: fundingCreatedAt + 701n,
+}), "cannot cross a changed wallet request count");
+
+const xFixture = FUNDING_FIXTURES.xDirectReply;
+const xPending = bindXFundingIntent(wethFundingIntent, {
+  confirmationTweetId: xFixture.confirmationTweetId,
+  requesterXUserId: xFixture.requesterXUserId,
+  confirmationChannel: "x",
+  confirmationText: xPreparedConfirmation(wethFundingIntent),
+});
+const remainingXPending = bindXFundingIntent(remainingOpenIntent, {
+  confirmationTweetId: "1777777777777777777",
+  requesterXUserId: xFixture.requesterXUserId,
+  confirmationChannel: "x",
+  confirmationText: xPreparedConfirmation(remainingOpenIntent),
+});
+check("remaining-open X pending record carries no swap source bounds", remainingXPending.sourceToken === null && remainingXPending.maximumSourceInputRaw === null && remainingXPending.minimumBaseUsdcOutputRaw === null && !/(\/wallet\/swap|idempotencyKey|"bankr":)/i.test(JSON.stringify(remainingXPending.economicIntent)));
+rejects("X binding rejects a non-X confirmation channel", () => bindXFundingIntent(wethFundingIntent, {
+  confirmationTweetId: xFixture.confirmationTweetId,
+  requesterXUserId: xFixture.requesterXUserId,
+  confirmationChannel: "chat",
+  confirmationText: xPreparedConfirmation(wethFundingIntent),
+}), "trusted X post metadata");
+rejects("X binding rejects altered posted confirmation text", () => bindXFundingIntent(wethFundingIntent, {
+  confirmationTweetId: xFixture.confirmationTweetId,
+  requesterXUserId: xFixture.requesterXUserId,
+  confirmationChannel: "x",
+  confirmationText: `${xPreparedConfirmation(wethFundingIntent)} altered`,
+}), "differs from the exact prepared");
+const xApprovalArgs = {
+  mode: "reply",
+  message: xFixture.message,
+  approvalTweetId: xFixture.approvalTweetId,
+  parentTweetId: xFixture.confirmationTweetId,
+  referenceType: "replied_to",
+  authorXUserId: xFixture.requesterXUserId,
+  linkedWallet: wallet,
+  now: fundingCreatedAt + 100n,
+};
+check("prepared X confirmation fits one tweet", xPreparedConfirmation(wethFundingIntent).length <= 280);
+check("self-contained X fallback fits one tweet", xSelfContainedCommand(wethFundingIntent).length <= 280);
+check("X confirmation encodes the complete action and compact units", ["do=swap+approve+open", "s=B/W", "m=0.006W", "u=8U", "f=0.0001E"].every((term) => xPreparedConfirmation(wethFundingIntent).includes(term)));
+const longDecimalFundingIntent = makeWethFundingIntent({
+  usdcBalance: 2_000_001n,
+  ethBalance: 123n,
+  acceptedCeilingBps: 100_000n,
+  entropyFeeWei: 10_000_000_000_000n,
+  sourceAmountRaw: 4_123_456_789_012_345n,
+  minUsdcOutRaw: 7_999_999n,
+  quotedUsdcOutRaw: 7_999_999n,
+  nativeSourceAmountRaw: 512_345_678_901_234n,
+  minNativeOutWei: 1_509_999_999_999_877n,
+  quotedNativeOutWei: 1_509_999_999_999_877n,
+});
+check("adversarial full-precision X confirmation falls back under 280 characters", xPreparedConfirmation(longDecimalFundingIntent).length <= 280 && xPreparedConfirmation(longDecimalFundingIntent).includes("m64=") && xPreparedConfirmation(longDecimalFundingIntent).includes("n64="));
+check("worst-case exact-decimal self-contained X command stays under 280 characters", xSelfContainedCommand(longDecimalFundingIntent).length <= 280 && xSelfContainedCommand(longDecimalFundingIntent).includes("u64=") && xSelfContainedCommand(longDecimalFundingIntent).includes("f64="));
+check("compact raw amount fields carry units in their labels without redundant suffixes", / m64=[A-Za-z0-9_-]+ u64=[A-Za-z0-9_-]+ n64=[A-Za-z0-9_-]+>[A-Za-z0-9_-]+ .* f64=[A-Za-z0-9_-]+ /.test(xPreparedConfirmation(longDecimalFundingIntent)));
+const compactIntentKey = xSelfContainedCommand(wethFundingIntent).match(/\bi64=([A-Za-z0-9_-]+)/)?.[1];
+equal("X self-contained command carries the full intent key", `0x${Buffer.from(compactIntentKey, "base64url").toString("hex")}`, fundingIntentKey(wethFundingIntent));
+equal("X pending binds confirmation tweet", xPending.confirmationTweetId, xFixture.confirmationTweetId);
+equal("X pending binds numeric user id", xPending.requesterXUserId, xFixture.requesterXUserId);
+equal("X pending binds linked wallet", xPending.wallet, wallet);
+equal("X pending begins unconsumed", xPending.consumed, false);
+check("X pending key is bytes32", /^0x[0-9a-f]{64}$/.test(xPendingIntentKey(xPending)));
+check("direct bound YES validates", verifyXFundingApproval(xPending, xApprovalArgs).ok);
+rejects("standalone bare YES authorizes nothing", () => verifyXFundingApproval(xPending, { ...xApprovalArgs, parentTweetId: null }), "directly reply");
+rejects("wrong parent tweet rejects YES", () => verifyXFundingApproval(xPending, { ...xApprovalArgs, parentTweetId: "1666666666666666666" }), "directly reply");
+rejects("quote-tweet reference cannot authorize bare YES", () => verifyXFundingApproval(xPending, { ...xApprovalArgs, referenceType: "quoted" }), "trusted replied_to");
+rejects("repost reference cannot authorize bare YES", () => verifyXFundingApproval(xPending, { ...xApprovalArgs, referenceType: "retweeted" }), "trusted replied_to");
+rejects("confirmation tweet cannot approve itself", () => verifyXFundingApproval(xPending, { ...xApprovalArgs, approvalTweetId: xFixture.confirmationTweetId }), "must differ");
+rejects("wrong numeric X identity rejects YES", () => verifyXFundingApproval(xPending, { ...xApprovalArgs, authorXUserId: "1555555555555555555" }), "numeric X author id");
+rejects("changed linked wallet rejects YES", () => verifyXFundingApproval(xPending, { ...xApprovalArgs, linkedWallet: otherWallet }), "linked wallet");
+rejects("expired X intent rejects YES", () => verifyXFundingApproval(xPending, { ...xApprovalArgs, now: fundingExpiresAt }), "expired");
+const consumedXPending = { ...xPending, consumed: true };
+rejects("consumed X intent rejects replay", () => verifyXFundingApproval(consumedXPending, xApprovalArgs), "already consumed");
+check("exact self-contained X fallback validates", verifyXFundingApproval(xPending, {
+  ...xApprovalArgs,
+  mode: "self-contained",
+  message: xPending.selfContainedCommand,
+  parentTweetId: null,
+}).ok);
+rejects("short standalone command is not self-contained", () => verifyXFundingApproval(xPending, {
+  ...xApprovalArgs,
+  mode: "self-contained",
+  message: "@bankrbot yes",
+  parentTweetId: null,
+}), "exact self-contained");
+check("fixture covers required adversarial X and funding cases", [
+  "standalone-bare-yes", "wrong-direct-parent", "same-handle-different-numeric-user-id",
+  "linked-wallet-changed", "expired-intent", "already-consumed-intent",
+  "different-chain-source-in-combined-flow", "duplicate-swap-idempotency-key",
+  "offer-hash-changed-after-swap",
+].every((entry) => FUNDING_FIXTURES.negativeCases.includes(entry)));
 
 // Synthetic direct and EntryPoint v0.7 / Kernel envelopes.
 const logicalTarget = ADDR.gacha;
@@ -645,11 +969,16 @@ check("Bankr policy requires fail-on-error single call", BANKR_EXECUTION.policy.
 check("Bankr policy rejects batches and paymaster", BANKR_EXECUTION.policy.rejectWalletBatch && BANKR_EXECUTION.sponsored.account.requireEmptyPaymasterAndData);
 equal("Bankr live fixture count", BANKR_EXECUTION.sponsored.liveRegressionFixtures.length, 3);
 equal("Bankr direct live fixture count", BANKR_EXECUTION.direct.liveRegressionFixtures.length, 1);
-equal("acquisition stays Bankr-native", BANKR_EXECUTION.acquisition.mode, "separate-bankr-native-trade");
+equal("acquisition stays structured Bankr-native", BANKR_EXECUTION.acquisition.mode, "structured-bankr-wallet-api");
 equal("local acquisition calldata is forbidden", BANKR_EXECUTION.acquisition.localSwapCalldata, "forbidden");
-check("acquisition continuation requires mined trade and fresh USDC read", /mined Bankr-native trade receipt.*fresh planner read.*official Base USDC/.test(BANKR_EXECUTION.acquisition.continuationGate));
-check("acquisition makes no unenforced transfer-log claim", !Object.hasOwn(BANKR_EXECUTION.acquisition, "requireCanonicalTransferLogs"));
-check("acquisition makes no unenforced source-asset claim", !Object.hasOwn(BANKR_EXECUTION.acquisition, "rejectOtherSourceAssets") && !Object.hasOwn(BANKR_EXECUTION.acquisition, "provenSourceAssets"));
+equal("pack funding gets one bounded confirmation", BANKR_EXECUTION.acquisition.packFundingConfirmation, "one-bounded-confirmation-after-explicit-source-choice");
+check("acquisition continuation rereads dual assets and offer", /canonical Base USDC.*native Base ETH.*unchanged offer hash and ceiling.*fee at or below the confirmed cap/.test(BANKR_EXECUTION.acquisition.continuationGate));
+check("acquisition requires swap idempotency", BANKR_EXECUTION.acquisition.swap.requireIdempotencyKeyPerLeg && BANKR_EXECUTION.acquisition.swap.safeRetryUsesSameBodyAndKey);
+deepEqual("acquisition marks ambiguous swap statuses", BANKR_EXECUTION.acquisition.swap.ambiguousStatuses, [502, 504]);
+check("acquisition never auto-selects or downgrades", BANKR_EXECUTION.acquisition.sourceSelection.automaticSelection === "forbidden" && BANKR_EXECUTION.acquisition.sourceSelection.automaticLowerPack === "forbidden");
+check("cross-chain acquisition is separate", !BANKR_EXECUTION.acquisition.crossChain.combinedWithPackOpen && BANKR_EXECUTION.acquisition.crossChain.requiresSeparateConfirmation);
+equal("vague acquisition prompt is forbidden", BANKR_EXECUTION.acquisition.naturalLanguageSwapPrompt, "forbidden");
+check("raw submit ambiguity requires state reconciliation", /allowance.*PackOpened\/request state/.test(BANKR_EXECUTION.acquisition.rawSubmitAmbiguity));
 
 const skillMarkdown = readFileSync(new URL("../SKILL.md", import.meta.url), "utf8");
 const catalog = JSON.parse(readFileSync(new URL("../catalog.json", import.meta.url), "utf8"));
@@ -657,7 +986,7 @@ const frontmatter = skillMarkdown.match(/^---\n([\s\S]*?)\n---(?:\n|$)/)?.[1] ??
 equal("Bankr skill name", frontmatter.match(/^name:\s*(.+)$/m)?.[1]?.trim(), "stonk-gacha");
 check("Bankr skill description exists", /^description:\s*\S.+$/m.test(frontmatter));
 check("Bankr top-level tags exist", /^tags:\s*\[[^\]]+\]$/m.test(frontmatter));
-equal("Bankr top-level version", Number(frontmatter.match(/^version:\s*(\d+)$/m)?.[1]), 1);
+equal("Bankr top-level version", Number(frontmatter.match(/^version:\s*(\d+)$/m)?.[1]), 2);
 equal("Bankr top-level visibility", frontmatter.match(/^visibility:\s*(\S+)$/m)?.[1], "public");
 equal("catalog slug", catalog.slug, "stonk-gacha");
 equal("catalog schema", catalog.schemaVersion, 1);
@@ -667,6 +996,7 @@ check("catalog points at public source", catalog.install.command.includes("githu
 for (const relative of [
   "SKILL.md", "references/operations.md", "references/bankr-execution.md",
   "references/deployment.json", "references/signing-allowlist.json", "references/bankr-execution.json",
+  "references/funding-policy.json", "references/funding-fixtures.json", "references/x-confirmation.md",
 ]) {
   try {
     const bytes = statSync(new URL(`../${relative}`, import.meta.url)).size;

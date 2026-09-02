@@ -61,6 +61,13 @@ set, route hashes, pack/request, amount, fee, quote floor, recipient, spender,
 or irreversible effect changes. A plan context/key proves integrity, not user
 authorization.
 
+For a funded pack open, the planner's one bounded confirmation additionally
+names the explicitly chosen Base ETH/WETH source, aggregate maximum source
+spend, minimum canonical Base USDC output, any WETH-to-native top-up bounds,
+offer hash, accepted ceiling, native fee cap, expiry, and the conditional
+reset/exact-approval/open sequence. Do not split those known steps into repeated
+prompts, and do not reuse the confirmation for changed terms or another action.
+
 ## Inspect calldata
 
 Immediately before each submission, use the context and key from that exact
@@ -107,12 +114,175 @@ Use the runtime's protected authentication mechanism; never generate a command
 containing a real key. Submit one transaction at a time. Never parallelize an
 approval with its dependent action, and never replay a stale plan.
 
-If a planner reports a USDC deficit, acquisition is a separate Bankr-native
-trade. Confirm that trade's source asset, exact input or maximum input, output
-floor, fees, and slippage in Bankr; require its mined receipt; then rerun this
-skill's planner. This skill creates no local swap calldata and claims no source-
-asset allowlist. The continuation gate is the fresh planner read of the pinned
-official Base USDC balance.
+## Fund a USDC-short pack open
+
+Stonk Gacha pulls canonical Base USDC for the pack and forwards a separate exact
+native Base ETH `msg.value` to Pyth Entropy. Treat these as two independent
+preflight assets. Sponsored gas does not supply call value, and WETH does not
+count as native ETH.
+
+### 1. Calculate, show, and ask
+
+Run `plan-open-pack`. When canonical Base USDC is below the current pack price,
+the planner emits `choose-funding-source` with the exact raw and formatted
+deficit, Base ETH balance, Base WETH balance, live Entropy fee, and required
+native reserve.
+
+Cross-check balances with Bankr's structured Base portfolio read. Match USDC and
+WETH by the canonical addresses in `funding-policy.json`, not by symbol. Show
+eligible Base ETH and WETH balances and ask the user which one to use. Never:
+
+- choose ETH, WETH, or any other token automatically;
+- count ETH/WETH on another chain as a Base balance;
+- lower the pack without a new explicit pack choice; or
+- swap anything merely because it appears in the portfolio.
+
+### 2. Quote the explicitly selected source
+
+Use Bankr's official structured flow: `POST /wallet/swap-quote`, then pass the
+exact quote bounds to `plan-open-pack-funding`. In Bankr's quote response,
+`from.amount` is human-readable input but `to.amount` is the quoted buy amount
+in raw base units. Bind that exact `to.amount` string as
+`--quoted-usdc-out-raw`; never substitute `to.formattedAmount`, `minBuyAmount`,
+or a locally converted estimate.
+
+Quote fields must come from the authenticated Bankr Wallet API response owned
+by the runtime, never from user text, pasted JSON, a screenshot, or conversation
+history. The local CLI can validate and bind every economic field but cannot
+cryptographically authenticate quote-response provenance; the authenticated
+runtime-to-CLI handoff is an explicit trust boundary.
+
+Set `--min-usdc-out` to the exact human-readable canonical Base USDC deficit,
+not merely an amount at least as large. Use the quote's explicit slippage bps.
+The planner requires quoted raw output at or above the floor and rejects an
+oversized quote above `ceil(deficitRaw * 10000 / (10000 - slippageBps))`. Resize
+and requote instead of accepting excess output as authority for extra source
+spend.
+
+- **ETH source:** maximum sell must leave the live Entropy fee cap plus the
+  confirmed native headroom in Base ETH. Never sell the full balance.
+- **WETH source:** the USDC leg spends only enough WETH to cover the deficit. If
+  native Base ETH is below fee cap plus headroom, also quote a small bounded
+  WETH-to-native ETH leg whose minimum output equals that exact shortfall. The
+  planner orders this top-up before the USDC leg. Bind that quote's raw
+  `to.amount` in wei as `--quoted-native-out-wei`; set `--min-native-out` to the
+  exact human-readable shortfall. Supply `--native-swap-slippage-bps`
+  explicitly. It is mandatory for this leg and must never inherit the USDC
+  leg's slippage by omission. The same oversized-quote bound applies using the
+  native shortfall and native-leg slippage.
+
+Every quote and intent must bind `fromChain`, `fromToken`, `toChain`, `toToken`,
+maximum sell amount, `minBuyAmount`, slippage, and an optional opaque quote id.
+The output token for the pack deficit is the canonical Base USDC address. Use
+the native sentinel pinned in `funding-policy.json` for ETH. Do not generate or
+accept router calldata, routes, token-name guesses, or a natural-language swap
+prompt.
+
+If the only source is on another chain, stop the combined flow. Offer a separate
+cross-chain acquisition confirmation that visibly names source chain/token,
+maximum source spend, bridge or network cost, and minimum canonical Base USDC
+output. If the bridge/network cost is unavailable or cannot be bounded, fail
+closed and do not present a confirmation. Only a mined and reconciled arrival
+on Base can start a new funded-open plan.
+
+### 3. Confirm once, then execute sequentially
+
+`plan-open-pack-funding` emits `combined-confirmation`, an opaque intent/key, and
+the exact ordered Bankr sequence. Show its full `report`. One confirmation covers
+only:
+
+1. each listed structured Bankr funding leg;
+2. a conditional zero reset of a mismatched nonzero USDC allowance;
+3. approval of exactly the current pack price; and
+4. one `openPack` using the confirmed pack, offer hash, ceiling, fee cap, and
+   fresh randomness.
+
+Persist the exact unexpired intent and execution journal, including the wallet's
+`requestCountOf(wallet)` baseline captured before funding. Atomically consume
+the authorization once before the first mutation, then submit one step at a
+time and wait for its mined result. Before every structured swap, re-resolve the
+current linked wallet, recheck intent expiry, and require the exact next journal
+step, request body, and idempotency key. A missing journal, already-consumed
+intent, reordered step, changed wallet, expired intent, or changed bound is a
+hard stop.
+
+For every `/wallet/swap` leg, use a distinct UUID `idempotencyKey`. A safe retry
+uses the identical body and same key. A `200` with `success:false` is a mined
+revert, not a filled swap. Never blind-retry a `504` or LaunchLab `502`: either
+may already be onchain, so reconcile Bankr Activity, the transaction hash, and
+fresh balances first. `429` and `503` are safe to retry with the same body/key;
+do not generate a new key for a retry of the same logical leg.
+
+### 4. Re-read before approval and open
+
+After every swap leg is reconciled as mined success, run the exact emitted
+`resume-open-pack-funding` command. It rechecks:
+
+- same active linked wallet, pack, unexpired intent, and live sales state;
+- the same wallet request-count baseline captured before the swaps;
+- enough canonical Base USDC for the pack;
+- enough native Base ETH for the exact current Entropy `msg.value` plus the
+  confirmed headroom;
+- unchanged pack price, expected/local offer hash, and accepted ceiling;
+- live Entropy fee at or below the confirmed cap; and
+- current USDC allowance.
+
+If only price, offer hash, ceiling, or live fee changed after funding completed,
+the planner may emit `remaining-open-reconfirmation` only when the fresh local
+offer commitment is valid, canonical Base USDC covers the new price, native ETH
+still covers fee plus headroom, and request count is unchanged. Its new
+short-lived intent/key and X line use `do=approve+open`; they authorize only the
+conditional allowance work and one open. They carry no swap authority. Never
+silently replace a hash, accept a different ceiling, raise a fee cap, downgrade
+the pack, or replay a funding leg.
+
+A changed wallet, pack, expiry, request count, invalid local offer, short
+balance, or paused sale cannot use that remaining-open rebase and emits no
+transaction.
+Any changed request count means a prior open may already have landed: stop,
+reconcile `PackOpened` and request state, and never replay the funded intent.
+
+The unchanged flow may proceed under the original consumed authorization: zero
+reset if needed, exact approval if needed, then one open, each sequentially.
+Immediately before signing each funded approval or open, run
+`inspect-calldata`. Its fresh gate rechecks intent expiry, request count, price,
+offer hash, ceiling, fee cap, and native ETH covering the live fee plus
+headroom. Failure emits no transaction and is not permission to regenerate or
+replay a step.
+
+## X-bound confirmation
+
+Follow [x-confirmation.md](x-confirmation.md). Bind only from trusted X posting-
+result metadata using `--confirmation-channel x` and the exact posted UTF-8 text
+as `--confirmation-message-hex`. User-supplied tweet ids, channels, or copied
+text do not prove the confirmation was posted.
+
+A bare `YES` or `CONFIRM` is valid only as a direct reply to the prepared
+confirmation tweet with trusted `--reference-type replied_to`, from the same
+numeric X user id, with an approval tweet id different from the confirmation
+tweet id, while the same Bankr wallet remains linked, before expiry, and while
+the durable pending intent remains unconsumed. Quote-tweet, repost, and generic
+reference metadata reject. Conversation history, handles, and an unrelated
+`@bankrbot yes` are not authorization.
+
+If the runtime cannot prove the parent/referenced tweet id, require the exact
+self-contained command emitted by the planner. Before any external mutation,
+atomically compare-and-set the pending record from `consumed:false` to
+`consumed:true` and create the execution journal. That same atomic boundary must
+recheck current time against expiry and freshly resolve the current linked
+wallet. Before every swap, repeat the expiry, linked-wallet, and next-journal-
+body/idempotency checks.
+
+## Bankr source patterns
+
+The funding boundary follows Bankr's published
+[Wallet API swap documentation](https://docs.bankr.bot/wallet-api/swap/),
+[Hunch source-selection consent](https://github.com/BankrBot/skills/blob/main/hunch/SKILL.md#L340-L367),
+[Cat Town's token-plus-native gacha preflight](https://github.com/BankrBot/skills/blob/main/cattown/SKILL.md#L542-L560),
+[Aero Stock LP's bounded sequence confirmation](https://github.com/BankrBot/skills/blob/main/aero-stock-lp/SKILL.md#L52-L66),
+and the [HoodMarkets X wallet/thread boundary](https://github.com/BankrBot/skills/blob/main/hoodmarkets/references/AUTH-BOUNDARY.md).
+These are design references; Stonk Gacha's pinned deployment, assets, exact
+deficit, offer commitment, and native fee rules remain authoritative here.
 
 Bankr access controls may reject arbitrary calldata, recipients, amounts, or
 daily limits. Do not ask the user to weaken a control or route around it through
@@ -171,3 +341,9 @@ A pending, unavailable, reverted, or ambiguous transaction is not permission to
 retry. Recover from its hash and fresh Base state. If receipt or postcondition
 proof remains incomplete, report "submitted but unverified," include the hash,
 and stop.
+
+`/wallet/submit` has no documented idempotency field. For an ambiguous approval,
+reconcile Bankr Activity/nonce and the current USDC allowance before any resend.
+For an ambiguous `openPack`, reconcile Bankr Activity, scoped `PackOpened`, and
+the wallet's fresh request state. Never recreate approval or replay pack
+randomness merely because the HTTP response was lost.

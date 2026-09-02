@@ -3,7 +3,7 @@
 // verifies the reviewed deployment, and emits at most one unsigned transaction.
 // It never signs, submits, swaps wallet assets, or chooses an outcome.
 
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import {
   decodeCallArguments,
   decodeBytes32,
@@ -51,6 +51,31 @@ import {
 } from "./lib/bankr.mjs";
 import { eventTopic, keccak256 } from "./lib/keccak256.mjs";
 import {
+  DEFAULT_INTENT_TTL_SECONDS,
+  DEFAULT_NATIVE_HEADROOM_WEI,
+  FUNDING_POLICY,
+  MAX_INTENT_TTL_SECONDS,
+  MAX_NATIVE_HEADROOM_WEI,
+  MIN_NATIVE_HEADROOM_WEI,
+  bindXFundingIntent,
+  createFundingIntent,
+  decodeFundingIntent,
+  decodeXPendingIntent,
+  encodeFundingIntent,
+  encodeXPendingIntent,
+  fundingIntentKey,
+  fundingResumeAssessment,
+  fundingSourceOptions,
+  parseMinimumNative,
+  parseMinimumUsdc,
+  parseSourceAmount,
+  rebaseFundingIntentForRemainingOpen,
+  verifyXFundingApproval,
+  xPendingIntentKey,
+  xPreparedConfirmation,
+  xSelfContainedCommand,
+} from "./lib/funding.mjs";
+import {
   ADDR,
   BPS,
   DEPLOYMENT,
@@ -89,6 +114,22 @@ const COMMAND_FLAGS = Object.freeze({
   request: ["wallet", "request-id"],
   "profit-status": ["wallet"],
   "plan-open-pack": ["wallet", "pack-index", "user-random"],
+  "plan-open-pack-funding": [
+    "wallet", "pack-index", "source-token", "source-amount", "min-usdc-out", "quoted-usdc-out-raw",
+    "swap-slippage-bps", "quote-id", "swap-idempotency-key",
+    "native-source-amount", "min-native-out", "quoted-native-out-wei", "native-swap-slippage-bps",
+    "native-quote-id", "native-swap-idempotency-key", "native-headroom-wei",
+    "intent-ttl-seconds", "user-random",
+  ],
+  "resume-open-pack-funding": ["wallet", "intent", "intent-key"],
+  "bind-x-funding-intent": [
+    "wallet", "intent", "intent-key", "x-user-id", "confirmation-tweet-id",
+    "confirmation-channel", "confirmation-message-hex",
+  ],
+  "verify-x-funding-approval": [
+    "wallet", "pending-intent", "pending-intent-key", "approval-mode", "message", "message-hex",
+    "approval-tweet-id", "parent-tweet-id", "reference-type", "x-user-id",
+  ],
   "plan-revoke-usdc": ["wallet"],
   "plan-claim-prize": ["wallet", "request-id", "recipient", "slippage-bps"],
   "plan-expire-request": ["wallet", "request-id"],
@@ -191,6 +232,36 @@ function bytes32Arg(name) {
   return value.toLowerCase();
 }
 
+function decimalAmountArg(name, parser) {
+  try {
+    const amount = parser(need(name));
+    gate(amount > 0n, "args", `--${name} must be greater than zero`);
+    return amount;
+  } catch (error) {
+    if (error instanceof GateError) throw error;
+    throw new GateError("args", error.message);
+  }
+}
+
+function optionalBoundedText(name, pattern, description) {
+  const value = args[name];
+  if (value === undefined) return null;
+  gate(value !== true && pattern.test(String(value)), "args", `--${name} ${description}`);
+  return String(value);
+}
+
+function decodeUtf8HexArg(name) {
+  const value = need(name);
+  gate(/^0x(?:[0-9a-fA-F]{2})+$/.test(value) && value.length <= 2 + 4096 * 2, "args", `--${name} must be non-empty UTF-8 hex under 4 KiB`);
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(
+      Uint8Array.from(value.slice(2).match(/.{2}/g).map((entry) => Number.parseInt(entry, 16))),
+    );
+  } catch {
+    throw new GateError("args", `--${name} is not valid UTF-8`);
+  }
+}
+
 function rejectUnknownFlags() {
   if (command === undefined) {
     gate(Object.keys(args).length === 0, "args", "help takes no flags when no command is supplied");
@@ -279,7 +350,7 @@ function inspectionKey(wallet, tx, contextHex) {
   }));
 }
 
-async function finalPlan({ action, wallet, tx, terms, report, reads, expectedEvents, postconditions, warnings = [], snapshot, resume = null }) {
+async function finalPlan({ action, wallet, tx, terms, report, reads, expectedEvents, postconditions, warnings = [], snapshot, resume = null, authorization = null }) {
   const preflight = await simulation(tx, wallet, snapshot.ref);
   await confirmSnapshot(snapshot);
   const inspection = encodeInspectionContext(action, terms);
@@ -303,12 +374,15 @@ async function finalPlan({ action, wallet, tx, terms, report, reads, expectedEve
     preflight,
     expectedEvents,
     postconditions,
+    ...(authorization ? { authorization } : {}),
     ...(resume ? { resume } : {}),
-    submitRule: "Show the complete report and exact terms. Obtain explicit confirmation for this confirmationKey. Immediately re-run from fresh chain state using the emitted resume command when present. If the key or terms changed, obtain new confirmation. Submit only this one transaction with waitForConfirmation=true. Treat an unknown outcome as pending investigation, never as permission to replay.",
+    submitRule: authorization
+      ? "Do not ask again only if the runtime has the exact unexpired combined funding authorization, its one-time confirmation was atomically consumed, and this phase is the next unreconciled step in that execution journal. Submit only this transaction, wait for a successful receipt, then rerun the emitted resume command. A missing journal, changed term, or ambiguous prior submit is a hard stop, not permission to recreate approval."
+      : "Show the complete report and exact terms. Obtain explicit confirmation for this confirmationKey. Immediately re-run from fresh chain state using the emitted resume command when present. If the key or terms changed, obtain new confirmation. Submit only this one transaction with waitForConfirmation=true. Treat an unknown outcome as pending investigation, never as permission to replay.",
   };
 }
 
-async function approvalPlan({ action, wallet, tx, terms, report, reads, warnings = [], snapshot, resume }) {
+async function approvalPlan({ action, wallet, tx, terms, report, reads, warnings = [], snapshot, resume, authorization = null }) {
   const preflight = await simulation(tx, wallet, snapshot.ref);
   await confirmSnapshot(snapshot);
   const inspection = encodeInspectionContext(action, terms);
@@ -331,7 +405,10 @@ async function approvalPlan({ action, wallet, tx, terms, report, reads, warnings
     txs: [tx],
     preflight,
     expectedEvents: ["Approval"],
-    next: `After explicit confirmation, submit this one scoped approval and wait for a successful receipt. Then run: ${resume}. Re-read every mutable term; do not submit an action from this stale approval plan. If the action is abandoned after a nonzero approval, run plan-revoke-usdc.`,
+    ...(authorization ? { authorization } : {}),
+    next: authorization
+      ? `Only under the still-valid recorded combined authorization, submit this one scoped approval and wait for a successful receipt. Then run: ${resume}. Reconcile an ambiguous result from current allowance and Bankr activity before any resend; /wallet/submit has no documented idempotency key.`
+      : `After explicit confirmation, submit this one scoped approval and wait for a successful receipt. Then run: ${resume}. Re-read every mutable term; do not submit an action from this stale approval plan. If the action is abandoned after a nonzero approval, run plan-revoke-usdc.`,
   };
 }
 
@@ -361,6 +438,48 @@ function fundingRequired(wallet, balance, required, resume, purpose) {
     purpose,
     instruction: `Stop this Stonk Gacha plan. This output is not swap authorization. If the user separately asks Bankr to acquire at least ${formatUnits(deficit, USDC_DECIMALS)} official Base USDC, confirm the source asset, exact input or maximum input, output floor, fees, and slippage as a separate Bankr-native trade. This skill does not trust or manufacture swap calldata. After Bankr proves that trade mined, run the fresh balance gate again with: ${resume}`,
   }, 2);
+}
+
+function openPackFundingRequired({ wallet, packIndex, usdcBalance, wethBalance, ethBalance, offer, snapshot }) {
+  const options = fundingSourceOptions({
+    usdcBalance,
+    packPriceUsdc: BigInt(offer.priceUsdc),
+    ethBalance,
+    wethBalance,
+    entropyFeeWei: BigInt(offer.entropyFee),
+  });
+  out({
+    ok: true,
+    command,
+    phase: "choose-funding-source",
+    gate: "canonical-base-usdc-balance",
+    network: { name: "Base", chainId: 8453 },
+    snapshot: snapshotView(snapshot),
+    wallet,
+    pack: {
+      packIndex,
+      priceUsdcRaw: offer.priceUsdc,
+      priceUsdc: offer.priceUsdcFormatted,
+      expectedOfferHash: offer.offerHash,
+      acceptedCeilingBps: offer.ceilingBps,
+      entropyFeeWei: offer.entropyFee,
+    },
+    canonicalAssets: {
+      usdc: { address: ADDR.usdc, decimals: 6, balanceRaw: usdcBalance },
+      nativeEth: { address: FUNDING_POLICY.walletApi.nativeTokenSentinel, decimals: 18, balanceWei: ethBalance },
+      weth: { address: ADDR.weth, decimals: 18, balanceWei: wethBalance },
+    },
+    funding: options,
+    bankrPortfolioRead: {
+      method: FUNDING_POLICY.walletApi.portfolio.method,
+      path: FUNDING_POLICY.walletApi.portfolio.path,
+      rule: "Match Base ERC-20 balances by exact address and keep decimal strings exact; do not parse balances as floating point.",
+    },
+    sourceSelectionRequired: true,
+    instruction: `Do not choose or swap automatically. Show the eligible Base ETH and Base WETH balances above and ask the user which source to use. After the user names ETH or WETH, obtain the smallest exact-input Bankr quote whose minBuyAmount equals the ${options.exactDeficitUsdc} USDC deficit, then run plan-open-pack-funding with that quote's exact input amount, raw to.amount, floor, slippage, and a persistent UUID idempotency key. WETH does not satisfy native msg.value.`,
+    crossChainRule: "ETH or WETH on any other chain is not a Base balance. Any cross-chain acquisition is a separate confirmation that must name the source chain/token, maximum spend, bridge or network cost, and minimum canonical Base USDC output; it is never bundled silently with openPack.",
+    lowerPackRule: "Never downgrade the pack automatically. A lower pack index requires a new explicit user choice and a fresh planner run.",
+  });
 }
 
 function freshRandomArg() {
@@ -447,10 +566,11 @@ async function planOpenPack() {
   const wallet = walletArg();
   const packIndex = packIndexArg();
   const { snapshot } = await deploymentGate();
-  const [salesPaused, offer, usdcBalance, allowance, ethBalance] = await Promise.all([
+  const [salesPaused, offer, usdcBalance, wethBalance, allowance, ethBalance] = await Promise.all([
     readBool(ADDR.gacha, "salesPaused()", [], [], snapshot.ref),
     readOffer(packIndex, snapshot),
     readUint(ADDR.usdc, SIG.balanceOf, ["address"], [wallet], snapshot.ref),
+    readUint(ADDR.weth, SIG.balanceOf, ["address"], [wallet], snapshot.ref),
     readUint(ADDR.usdc, SIG.allowance, ["address", "address"], [wallet, ADDR.gacha], snapshot.ref),
     getBalance(wallet, snapshot.ref),
   ]);
@@ -461,7 +581,7 @@ async function planOpenPack() {
   const resumeBase = `node scripts/stonk-gacha.mjs plan-open-pack --wallet ${wallet} --pack-index ${packIndex}`;
   if (usdcBalance < priceUsdc) {
     await confirmSnapshot(snapshot);
-    return fundingRequired(wallet, usdcBalance, priceUsdc, resumeBase, `open pack index ${packIndex}`);
+    return openPackFundingRequired({ wallet, packIndex, usdcBalance, wethBalance, ethBalance, offer, snapshot });
   }
   gate(ethBalance >= entropyFee, "native-fee", "wallet ETH balance is below the exact live Pyth Entropy fee", { ethBalance, entropyFee });
 
@@ -518,6 +638,415 @@ async function planOpenPack() {
     snapshot,
     resume,
   }));
+}
+
+async function planOpenPackFunding() {
+  const wallet = walletArg();
+  const packIndex = packIndexArg();
+  const sourceToken = String(need("source-token")).toUpperCase();
+  gate(sourceToken === "ETH" || sourceToken === "WETH", "args", "--source-token must be explicitly selected as ETH or WETH");
+  const sourceAmountRaw = decimalAmountArg("source-amount", parseSourceAmount);
+  const minUsdcOutRaw = decimalAmountArg("min-usdc-out", parseMinimumUsdc);
+  const quotedUsdcOutRaw = integerArg("quoted-usdc-out-raw", { min: 1n });
+  const swapSlippage = Number(integerArg("swap-slippage-bps", { min: 10n, max: 2_000n }));
+  const quoteId = optionalBoundedText("quote-id", /^[A-Za-z0-9._:-]{1,256}$/, "must be a bounded opaque Bankr quote id");
+  const swapIdempotencyKey = args["swap-idempotency-key"] === undefined
+    ? randomUUID()
+    : optionalBoundedText("swap-idempotency-key", /^[0-9a-fA-F-]{36}$/, "must be a UUID");
+  const nativeHeadroomWei = args["native-headroom-wei"] === undefined
+    ? DEFAULT_NATIVE_HEADROOM_WEI
+    : integerArg("native-headroom-wei", { min: MIN_NATIVE_HEADROOM_WEI, max: MAX_NATIVE_HEADROOM_WEI });
+  const ttl = args["intent-ttl-seconds"] === undefined
+    ? DEFAULT_INTENT_TTL_SECONDS
+    : integerArg("intent-ttl-seconds", { min: 60n, max: MAX_INTENT_TTL_SECONDS });
+
+  const nativeSourceAmountRaw = args["native-source-amount"] === undefined
+    ? null
+    : decimalAmountArg("native-source-amount", parseSourceAmount);
+  const minNativeOutWei = args["min-native-out"] === undefined
+    ? null
+    : decimalAmountArg("min-native-out", parseMinimumNative);
+  const quotedNativeOutWei = args["quoted-native-out-wei"] === undefined
+    ? null
+    : integerArg("quoted-native-out-wei", { min: 1n });
+  const nativeSwapSlippage = args["native-swap-slippage-bps"] === undefined
+    ? null
+    : Number(integerArg("native-swap-slippage-bps", { min: 10n, max: 2_000n }));
+  const nativeQuoteId = optionalBoundedText("native-quote-id", /^[A-Za-z0-9._:-]{1,256}$/, "must be a bounded opaque Bankr quote id");
+  const nativeSwapIdempotencyKey = args["native-swap-idempotency-key"] === undefined
+    ? (nativeSourceAmountRaw === null ? null : randomUUID())
+    : optionalBoundedText("native-swap-idempotency-key", /^[0-9a-fA-F-]{36}$/, "must be a UUID");
+
+  const { snapshot } = await deploymentGate();
+  const [salesPaused, offer, usdcBalance, wethBalance, allowance, ethBalance, requestCount] = await Promise.all([
+    readBool(ADDR.gacha, "salesPaused()", [], [], snapshot.ref),
+    readOffer(packIndex, snapshot),
+    readUint(ADDR.usdc, SIG.balanceOf, ["address"], [wallet], snapshot.ref),
+    readUint(ADDR.weth, SIG.balanceOf, ["address"], [wallet], snapshot.ref),
+    readUint(ADDR.usdc, SIG.allowance, ["address", "address"], [wallet, ADDR.gacha], snapshot.ref),
+    getBalance(wallet, snapshot.ref),
+    readUint(ADDR.gacha, SIG.requestCountOf, ["address"], [wallet], snapshot.ref),
+  ]);
+  gate(!salesPaused, "sales", "new pack sales are currently paused; funding must not proceed for a pack that cannot open");
+  gate(usdcBalance < BigInt(offer.priceUsdc), "funding", "wallet already has enough canonical Base USDC; use plan-open-pack instead of moving another asset");
+  const random = freshRandomArg();
+  let intent;
+  try {
+    intent = createFundingIntent({
+      wallet,
+      packIndex,
+      packPriceUsdc: BigInt(offer.priceUsdc),
+      usdcBalance,
+      ethBalance,
+      wethBalance,
+      allowance,
+      requestCount,
+      spender: ADDR.gacha,
+      expectedOfferHash: offer.offerHash,
+      acceptedCeilingBps: BigInt(offer.ceilingBps),
+      entropyFeeWei: BigInt(offer.entropyFee),
+      nativeHeadroomWei,
+      sourceToken,
+      sourceAmountRaw,
+      minUsdcOutRaw,
+      quotedUsdcOutRaw,
+      swapSlippageBps: swapSlippage,
+      quoteId,
+      swapIdempotencyKey,
+      nativeSourceAmountRaw,
+      minNativeOutWei,
+      quotedNativeOutWei,
+      nativeSwapSlippageBps: nativeSwapSlippage,
+      nativeQuoteId,
+      nativeSwapIdempotencyKey,
+      userRandomNumber: random.value,
+      createdAt: snapshot.timestamp,
+      expiresAt: snapshot.timestamp + ttl,
+    });
+  } catch (error) {
+    throw new GateError("funding-intent", error.message);
+  }
+  const intentHex = encodeFundingIntent(intent);
+  const intentKey = fundingIntentKey(intent);
+  const preparedXConfirmation = xPreparedConfirmation(intent);
+  const preparedXConfirmationHex = `0x${Buffer.from(preparedXConfirmation, "utf8").toString("hex")}`;
+  const nativeLeg = intent.fundingLegs.find((leg) => leg.purpose === "native-top-up");
+  const usdcLeg = intent.fundingLegs.find((leg) => leg.purpose === "usdc-deficit");
+  const approvalText = `reset any mismatched nonzero allowance first, then approve exactly ${formatUnits(intent.pack.priceUsdcRaw, 6)} USDC if needed`;
+  const fundingText = nativeLeg
+    ? `run two Base swaps with at most ${intent.source.aggregateMaximumInput} WETH total: at most ${nativeLeg.amount} WETH for at least ${nativeLeg.minBuyAmount} native ETH at ${nativeLeg.slippageBps} bps, then at most ${usdcLeg.amount} WETH for at least ${usdcLeg.minBuyAmount} canonical Base USDC at ${usdcLeg.slippageBps} bps`
+    : `swap at most ${usdcLeg.amount} ${intent.source.token} on Base for at least ${usdcLeg.minBuyAmount} canonical Base USDC at ${usdcLeg.slippageBps} bps`;
+  const report = `From wallet ${wallet}, ${fundingText}; ${approvalText}; then open pack index ${packIndex} for ${formatUnits(intent.pack.priceUsdcRaw, 6)} USDC using offer ${intent.pack.expectedOfferHash}, ceiling ${intent.pack.acceptedCeilingBps} bps, and a Pyth native fee capped at ${formatUnits(intent.pack.entropyFeeCapWei, 18)} ETH before intent expiry ${intent.expiresAt}?`;
+  await confirmSnapshot(snapshot);
+  out({
+    ok: true,
+    command,
+    phase: "combined-confirmation",
+    network: { name: "Base", chainId: 8453 },
+    snapshot: snapshotView(snapshot),
+    wallet,
+    intent,
+    intentHex,
+    intentKey,
+    report,
+    x: {
+      preparedConfirmationTweet: preparedXConfirmation,
+      selfContainedFallbackCommand: xSelfContainedCommand(intent),
+      bindAfterPosting: `node scripts/stonk-gacha.mjs bind-x-funding-intent --wallet ${wallet} --intent ${intentHex} --intent-key ${intentKey} --x-user-id NUMERIC_X_USER_ID --confirmation-tweet-id POSTED_TWEET_ID --confirmation-channel x --confirmation-message-hex ${preparedXConfirmationHex}`,
+      bindingRule: "The tweet id, channel, and exact post text must come from trusted X posting-result metadata. Never accept user-supplied ids or text as proof that this confirmation was posted.",
+    },
+    bankrSequence: [
+      ...intent.fundingLegs.map((leg, index) => ({
+        order: index + 1,
+        action: `Bankr structured ${leg.purpose} swap`,
+        request: leg.bankr,
+        receiptRule: "Submit this exact body. Wait for a mined response and require success:true. A 200 success:false is a mined revert. Preserve this idempotencyKey for every safe retry.",
+      })),
+      {
+        order: intent.fundingLegs.length + 1,
+        action: "fresh funded-open resume",
+        command: `node scripts/stonk-gacha.mjs resume-open-pack-funding --wallet ${wallet} --intent ${intentHex} --intent-key ${intentKey}`,
+        receiptRule: "Run only after every swap leg is reconciled as mined successfully; reread canonical USDC, native ETH, fee, price, offer hash, ceiling, and allowance.",
+      },
+    ],
+    confirmationPolicy: {
+      count: 1,
+      covers: ["every listed Bankr swap leg", "conditional stale-allowance reset", "exact USDC approval", "one openPack call"],
+      condition: "The runtime must persist this exact intent and atomically consume the user's explicit approval once. A different source, maximum input, minimum output, pack, offer, ceiling, fee cap, wallet, or expiry requires a new confirmation.",
+    },
+    retryPolicy: {
+      swap: "For 429/503 or another proven pre-broadcast retry, resend the identical /wallet/swap body with the same idempotencyKey. Never blind-retry 504 or LaunchLab 502; reconcile Bankr Activity, hash, and balances first.",
+      rawSubmit: "/wallet/submit has no documented idempotency field. Reconcile ambiguous approval from allowance plus Bankr activity/nonce, and ambiguous openPack from PackOpened/request state plus Bankr activity before any resend.",
+    },
+    crossChainRule: "This intent contains Base-only legs. Any other-chain ETH/WETH acquisition is a separate confirmation and cannot inherit this combined authorization.",
+    lowerPackRule: "A lower pack requires a new explicit user choice; never downgrade automatically.",
+    txs: [],
+  });
+}
+
+async function resumeOpenPackFunding() {
+  const wallet = walletArg();
+  const intentHex = need("intent");
+  const expectedIntentKey = bytes32Arg("intent-key");
+  let intent;
+  try {
+    intent = decodeFundingIntent(intentHex);
+  } catch (error) {
+    throw new GateError("funding-intent", error.message);
+  }
+  gate(fundingIntentKey(intent) === expectedIntentKey, "funding-intent", "funding intent key mismatch");
+  gate(intent.wallet === wallet, "funding-intent", "funding intent wallet differs from the active Bankr wallet");
+  gate(normalizeAddress(intent.approvalPolicy.spender) === ADDR.gacha, "funding-intent", "funding intent spender is not the verified StonkGacha deployment");
+  const packIndex = intent.pack.packIndex;
+  gate(packIndex >= 0 && packIndex < DEPLOYMENT.productTerms.packCount, "funding-intent", "funding intent pack is outside the deployed product");
+
+  const { snapshot } = await deploymentGate();
+  const [salesPaused, offer, usdcBalance, allowance, ethBalance, requestCount] = await Promise.all([
+    readBool(ADDR.gacha, "salesPaused()", [], [], snapshot.ref),
+    readOffer(packIndex, snapshot),
+    readUint(ADDR.usdc, SIG.balanceOf, ["address"], [wallet], snapshot.ref),
+    readUint(ADDR.usdc, SIG.allowance, ["address", "address"], [wallet, ADDR.gacha], snapshot.ref),
+    getBalance(wallet, snapshot.ref),
+    readUint(ADDR.gacha, SIG.requestCountOf, ["address"], [wallet], snapshot.ref),
+  ]);
+  const intentResumePreflight = intent.stage === "remaining-open" ? intent.remainingPreflight : intent.preflight;
+  const assessment = fundingResumeAssessment(intent, {
+    wallet,
+    packIndex,
+    timestamp: snapshot.timestamp,
+    salesPaused,
+    packPriceUsdc: BigInt(offer.priceUsdc),
+    offerHash: offer.offerHash,
+    computedOfferHash: offer.computedOfferHash,
+    ceilingBps: BigInt(offer.ceilingBps),
+    entropyFeeWei: BigInt(offer.entropyFee),
+    usdcBalance,
+    ethBalance,
+    walletRequestCount: requestCount,
+  });
+  if (!assessment.ok) {
+    const reconfirmableCodes = new Set(["price-changed", "offer-changed", "ceiling-changed", "fee-cap-exceeded"]);
+    const canPrepareRemainingOpen = assessment.issues.length > 0
+      && assessment.issues.every((entry) => reconfirmableCodes.has(entry.code))
+      && offer.offerHash.toLowerCase() === offer.computedOfferHash.toLowerCase()
+      && usdcBalance >= BigInt(offer.priceUsdc)
+      && ethBalance >= BigInt(offer.entropyFee) + BigInt(intentResumePreflight.nativeHeadroomWei)
+      && requestCount === BigInt(intentResumePreflight.walletRequestCount);
+    if (canPrepareRemainingOpen) {
+      let remainingIntent;
+      try {
+        remainingIntent = rebaseFundingIntentForRemainingOpen(intent, {
+          packPriceUsdc: BigInt(offer.priceUsdc),
+          expectedOfferHash: offer.offerHash,
+          acceptedCeilingBps: BigInt(offer.ceilingBps),
+          entropyFeeWei: BigInt(offer.entropyFee),
+          usdcBalance,
+          ethBalance,
+          allowance,
+          requestCount,
+          createdAt: snapshot.timestamp,
+          expiresAt: snapshot.timestamp + DEFAULT_INTENT_TTL_SECONDS,
+        });
+      } catch (error) {
+        throw new GateError("remaining-open-intent", error.message);
+      }
+      const remainingIntentHex = encodeFundingIntent(remainingIntent);
+      const remainingIntentKey = fundingIntentKey(remainingIntent);
+      const preparedX = xPreparedConfirmation(remainingIntent);
+      const preparedXHex = `0x${Buffer.from(preparedX, "utf8").toString("hex")}`;
+      await confirmSnapshot(snapshot);
+      out({
+        ok: true,
+        command,
+        phase: "remaining-open-reconfirmation",
+        gate: "fresh-confirmation-required",
+        wallet,
+        invalidatedIntentKey: expectedIntentKey,
+        changedTerms: assessment.issues,
+        fresh: { snapshot: snapshotView(snapshot), offer, usdcBalance, allowance, ethBalance, requestCount, salesPaused },
+        remainingIntent,
+        remainingIntentHex,
+        remainingIntentKey,
+        report: `Funding is complete, but the confirmed pack economics changed. Confirm only the remaining conditional allowance reset, exact ${formatUnits(BigInt(offer.priceUsdc), 6)} USDC approval, and one pack ${packIndex} open using offer ${offer.offerHash}, ceiling ${offer.ceilingBps} bps, exact native fee ${formatUnits(BigInt(offer.entropyFee), 18)} ETH, and expiry ${remainingIntent.expiresAt}. No swap is authorized by this replacement intent.`,
+        x: {
+          preparedConfirmationTweet: preparedX,
+          selfContainedFallbackCommand: xSelfContainedCommand(remainingIntent),
+          bindAfterPosting: `node scripts/stonk-gacha.mjs bind-x-funding-intent --wallet ${wallet} --intent ${remainingIntentHex} --intent-key ${remainingIntentKey} --x-user-id NUMERIC_X_USER_ID --confirmation-tweet-id POSTED_TWEET_ID --confirmation-channel x --confirmation-message-hex ${preparedXHex}`,
+        },
+        resumeAfterFreshConfirmation: `node scripts/stonk-gacha.mjs resume-open-pack-funding --wallet ${wallet} --intent ${remainingIntentHex} --intent-key ${remainingIntentKey}`,
+        authorizationPolicy: "This is a new one-time intent for approve+open only. The old consumed authorization cannot approve these changed terms, and no funding swap may be replayed.",
+        txs: [],
+      });
+      return;
+    }
+    await confirmSnapshot(snapshot);
+    out({
+      ok: false,
+      command,
+      phase: assessment.reconfirmationRequired ? "needs-reconfirmation" : "funding-incomplete",
+      gate: "funded-open-resume",
+      wallet,
+      intentKey: expectedIntentKey,
+      assessment,
+      fresh: { snapshot: snapshotView(snapshot), offer, usdcBalance, allowance, ethBalance, requestCount, salesPaused },
+      instruction: assessment.reconfirmationRequired
+        ? "Emit no transaction. The old combined confirmation cannot authorize changed economic terms. Prepare a new self-contained confirmation; never substitute the fresh offer hash, ceiling, price, fee cap, source bounds, or a lower pack silently."
+        : "Emit no transaction. Reconcile each Bankr funding leg and current balances. Do not repeat a swap or raw submission from this output.",
+      txs: [],
+    }, 2);
+    return;
+  }
+
+  const resume = `node scripts/stonk-gacha.mjs resume-open-pack-funding --wallet ${wallet} --intent ${intentHex} --intent-key ${expectedIntentKey}`;
+  const priceUsdc = BigInt(offer.priceUsdc);
+  const entropyFee = BigInt(offer.entropyFee);
+  const ceilingBps = BigInt(offer.ceilingBps);
+  const resumePreflight = intentResumePreflight;
+  const terms = {
+    packIndex,
+    packPriceUsdc: priceUsdc,
+    minCeilingBps: ceilingBps,
+    nominalRtpBps: BigInt(offer.nominalRtpBps),
+    expectedOfferHash: offer.offerHash,
+    orderedEligible: offer.eligible.map(({ token, routeHash }) => ({ token, routeHash })),
+    maxPayoutUsdc: BigInt(offer.maxPayoutUsdc),
+    entropyFeeWei: entropyFee,
+    entropyFeeCapWei: BigInt(intent.pack.entropyFeeCapWei),
+    userRandomNumber: intent.pack.userRandomNumber,
+    approval: { token: ADDR.usdc, spender: ADDR.gacha, exactAmount: priceUsdc },
+    fundingIntentKey: expectedIntentKey,
+    fundingIntentExpiresAt: BigInt(intent.expiresAt),
+    fundingBaselineRequestCount: BigInt(resumePreflight.walletRequestCount),
+    fundingNativeHeadroomWei: BigInt(resumePreflight.nativeHeadroomWei),
+  };
+  const authorization = {
+    mode: intent.stage === "remaining-open" ? "remaining-open-intent" : "combined-funding-intent",
+    intentKey: expectedIntentKey,
+    additionalConfirmationRequired: false,
+    runtimeGate: "Require the persisted unexpired authorization/execution journal for this exact intent. Its confirmation must already be atomically consumed once; only the next unreconciled step may run.",
+  };
+  const report = `Continue the already confirmed ${intent.stage === "remaining-open" ? "remaining approve+open" : "funded open"} for pack index ${packIndex}: canonical Base USDC now covers ${formatUnits(priceUsdc, 6)} USDC, offer ${offer.offerHash} and ceiling ${ceilingBps} bps are unchanged, and the exact current Pyth fee ${formatUnits(entropyFee, 18)} ETH remains within the confirmed ${formatUnits(BigInt(intent.pack.entropyFeeCapWei), 18)} ETH cap.`;
+  const approval = exactApprovalTx(allowance, priceUsdc, `funded pack index ${packIndex}`);
+  if (approval) {
+    out(await approvalPlan({
+      action: "open-pack",
+      wallet,
+      tx: approval,
+      terms,
+      report,
+      reads: { usdcBalance, currentAllowance: allowance, ethBalance, requestCount, offer, fundingResume: assessment },
+      warnings: ["This exact/reset approval is covered only by the recorded combined intent; no unrelated yes or conversation history may authorize it."],
+      snapshot,
+      resume,
+      authorization,
+    }));
+    return;
+  }
+  const tx = unsignedTx(
+    ADDR.gacha,
+    encodeCall("openPack(uint256,uint256,bytes32,bytes32)", ["uint256", "uint256", "bytes32", "bytes32"], [BigInt(packIndex), ceilingBps, offer.offerHash, intent.pack.userRandomNumber]),
+    `open funded Stonk Gacha pack index ${packIndex}`,
+    { value: entropyFee },
+  );
+  out(await finalPlan({
+    action: "open-pack",
+    wallet,
+    tx,
+    terms,
+    report,
+    reads: { usdcBalance, exactAllowance: allowance, ethBalance, requestCount, offer, fundingResume: assessment },
+    warnings: [
+      "Mark the execution journal's open step consumed before submission. An unknown outcome permanently forbids replaying this userRandomNumber.",
+      "PackOpened proves only Pending. Reconcile a missing /wallet/submit result from wallet request state and Bankr activity before considering any new attempt.",
+    ],
+    expectedEvents: ["PackOpened", "exact USDC Transfer wallet->StonkGacha"],
+    postconditions: ["a new request owned by the active wallet is Pending", "request terms match the exact confirmed offer", "USDC charge equals the selected pack price"],
+    snapshot,
+    resume,
+    authorization,
+  }));
+}
+
+function bindXIntent() {
+  const wallet = walletArg();
+  const intentHex = need("intent");
+  const expectedIntentKey = bytes32Arg("intent-key");
+  let intent;
+  try {
+    intent = decodeFundingIntent(intentHex);
+  } catch (error) {
+    throw new GateError("funding-intent", error.message);
+  }
+  gate(intent.wallet === wallet && fundingIntentKey(intent) === expectedIntentKey, "funding-intent", "intent wallet or key mismatch");
+  gate(normalizeAddress(intent.approvalPolicy.spender) === ADDR.gacha, "funding-intent", "intent spender is not the verified StonkGacha deployment");
+  gate(intent.pack.packIndex >= 0 && intent.pack.packIndex < DEPLOYMENT.productTerms.packCount, "funding-intent", "intent pack is outside the deployed product");
+  let pending;
+  try {
+    pending = bindXFundingIntent(intent, {
+      confirmationTweetId: need("confirmation-tweet-id"),
+      requesterXUserId: need("x-user-id"),
+      confirmationChannel: need("confirmation-channel"),
+      confirmationText: decodeUtf8HexArg("confirmation-message-hex"),
+    });
+  } catch (error) {
+    throw new GateError("x-binding", error.message);
+  }
+  const pendingHex = encodeXPendingIntent(pending);
+  const pendingKey = xPendingIntentKey(pending);
+  out({
+    ok: true,
+    command,
+    phase: "x-pending-bound",
+    wallet,
+    pendingIntent: pending,
+    pendingIntentHex: pendingHex,
+    pendingIntentKey: pendingKey,
+    persistenceRule: "The confirmation tweet id, exact text, and channel must come from trusted X posting-result metadata, never user input. Persist this record in the Bankr runtime's durable, atomic store, never in the installed skill. Bare YES is valid only with trusted replied_to metadata from requesterXUserId while the same wallet remains linked, before expiry, and while consumed is false.",
+    verifyReply: `node scripts/stonk-gacha.mjs verify-x-funding-approval --wallet ${wallet} --pending-intent ${pendingHex} --pending-intent-key ${pendingKey} --approval-mode reply --message YES --approval-tweet-id REPLY_TWEET_ID --parent-tweet-id ${pending.confirmationTweetId} --reference-type replied_to --x-user-id ${pending.requesterXUserId}`,
+    selfContainedFallbackCommand: pending.selfContainedCommand,
+  });
+}
+
+function verifyXApproval() {
+  const wallet = walletArg();
+  const pendingHex = need("pending-intent");
+  const expectedPendingKey = bytes32Arg("pending-intent-key");
+  let pending;
+  try {
+    pending = decodeXPendingIntent(pendingHex);
+  } catch (error) {
+    throw new GateError("x-binding", error.message);
+  }
+  gate(xPendingIntentKey(pending) === expectedPendingKey, "x-binding", "pending X intent key mismatch");
+  gate(pending.wallet === wallet, "x-binding", "pending X intent wallet differs from the current Bankr-linked wallet");
+  gate(normalizeAddress(pending.economicIntent.approvalPolicy.spender) === ADDR.gacha, "x-binding", "pending X intent spender is not the verified StonkGacha deployment");
+  const mode = need("approval-mode");
+  gate(mode === "reply" || mode === "self-contained", "args", "--approval-mode must be reply or self-contained");
+  gate(!args.message || !args["message-hex"], "args", "provide only one of --message or --message-hex");
+  const message = args["message-hex"] !== undefined ? decodeUtf8HexArg("message-hex") : need("message");
+  let proof;
+  try {
+    proof = verifyXFundingApproval(pending, {
+      mode,
+      message,
+      approvalTweetId: need("approval-tweet-id"),
+      parentTweetId: args["parent-tweet-id"] === undefined ? null : need("parent-tweet-id"),
+      referenceType: args["reference-type"] === undefined ? null : need("reference-type"),
+      authorXUserId: need("x-user-id"),
+      linkedWallet: wallet,
+      now: BigInt(Math.floor(Date.now() / 1_000)),
+    });
+  } catch (error) {
+    throw new GateError("x-approval", error.message);
+  }
+  out({
+    ok: true,
+    command,
+    phase: "validated-awaiting-atomic-consume",
+    wallet,
+    proof,
+    instruction: "The tweet id, exact replied_to reference type/parent id, and numeric author id must come from authenticated X event metadata, never parsed user text or conversation history. At consume time, re-resolve the linked wallet and current time, then atomically require the same wallet, an unexpired record, consumed:false, and create its execution journal while flipping consumed:true. If that boundary loses or any value changed, stop. Before every structured swap, recheck expiry, the current linked wallet, and the exact next journal body/idempotency key. This validation alone is not mutation authorization and must not be replayed.",
+  });
 }
 
 async function planRevokeUsdc() {
@@ -777,6 +1306,30 @@ async function inspectLogicalCall({ wallet, tx, contextHex, expectedInspectionKe
   const value = BigInt(tx.value);
   if (action.valueRule === "zero") gate(value === 0n, "value", "this logical call must carry zero native value");
 
+  const fundedOpen = contextAction === "open-pack" && terms.fundingIntentKey !== undefined;
+  if (fundedOpen) {
+    gate(/^0x[0-9a-f]{64}$/.test(String(terms.fundingIntentKey)), "inspection-context", "funding intent key is malformed");
+    const intentExpiry = BigInt(terms.fundingIntentExpiresAt);
+    const baselineRequestCount = BigInt(terms.fundingBaselineRequestCount);
+    const nativeHeadroom = BigInt(terms.fundingNativeHeadroomWei);
+    gate(intentExpiry > 0n && baselineRequestCount >= 0n && nativeHeadroom >= MIN_NATIVE_HEADROOM_WEI, "inspection-context", "funded-open expiry, request baseline, or native headroom is malformed");
+    if (verifyFreshState) {
+      gate(snapshot.timestamp < intentExpiry, "funding-intent", "combined funding authorization expired before signing");
+      const packIndex = Number(BigInt(terms.packIndex));
+      const [requestCount, freshOffer, freshNativeBalance] = await Promise.all([
+        readUint(ADDR.gacha, SIG.requestCountOf, ["address"], [wallet], block),
+        readOffer(packIndex, snapshot),
+        getBalance(wallet, block),
+      ]);
+      assertContextString(requestCount, baselineRequestCount, "funded-open wallet request count");
+      assertContextString(freshOffer.priceUsdc, terms.packPriceUsdc, "funded-open fresh pack price");
+      assertContextString(freshOffer.offerHash, terms.expectedOfferHash, "funded-open fresh offer hash");
+      assertContextString(freshOffer.ceilingBps, terms.minCeilingBps, "funded-open fresh ceiling");
+      gate(BigInt(freshOffer.entropyFee) <= BigInt(terms.entropyFeeCapWei), "funding-intent", "fresh Entropy fee exceeds the combined funding authorization cap");
+      gate(freshNativeBalance >= BigInt(freshOffer.entropyFee) + nativeHeadroom, "funding-intent", "fresh native ETH does not preserve exact msg.value plus confirmed headroom");
+    }
+  }
+
   if (action.name === "approve") {
     const [spender, amount] = values;
     gate(spender === ADDR.gacha, "approval", "USDC spender must be the pinned StonkGacha contract");
@@ -821,6 +1374,9 @@ async function inspectLogicalCall({ wallet, tx, contextHex, expectedInspectionKe
     assertContextString(offerHash, terms.expectedOfferHash, "offer hash");
     assertContextString(userRandom, terms.userRandomNumber, "buyer randomness");
     assertContextString(value, terms.entropyFeeWei, "bound Entropy fee");
+    if (fundedOpen) {
+      gate(BigInt(terms.entropyFeeCapWei) >= value, "inspection-context", "exact Entropy fee exceeds the combined funding authorization cap");
+    }
     assertContextString(terms.packPriceUsdc, DEPLOYMENT.productTerms.packPricesUsdcRaw[Number(packIndex)], "deployed pack price");
     const expectedMaxPayout = BigInt(terms.packPriceUsdc) * minCeiling / BPS;
     assertContextString(terms.maxPayoutUsdc, expectedMaxPayout, "maximum cash-backed payout");
@@ -1310,6 +1866,8 @@ function help() {
     ],
     planners: [
       "plan-open-pack --wallet --pack-index [--user-random]", "plan-revoke-usdc --wallet",
+      "plan-open-pack-funding --wallet --pack-index --source-token ETH|WETH --source-amount --min-usdc-out --quoted-usdc-out-raw --swap-slippage-bps [--quote-id --swap-idempotency-key --native-source-amount --min-native-out --quoted-native-out-wei --native-swap-slippage-bps --native-quote-id --native-swap-idempotency-key --native-headroom-wei --intent-ttl-seconds --user-random]",
+      "resume-open-pack-funding --wallet --intent --intent-key",
       "plan-claim-prize --wallet --request-id [--recipient --slippage-bps]",
       "plan-expire-request --wallet --request-id", "plan-claim-refund --wallet --request-id [--recipient]",
       "plan-fund-reserve --wallet --amount-usdc", "plan-distribute-profit --wallet [--amount-usdc --slippage-bps]",
@@ -1317,6 +1875,10 @@ function help() {
     inspection: [
       "inspect-calldata --wallet --chain-id 8453 --to --data --value --context --plan-key",
       "inspect-tx --wallet --tx --context --plan-key",
+    ],
+    xConfirmation: [
+      "bind-x-funding-intent --wallet --intent --intent-key --x-user-id --confirmation-tweet-id --confirmation-channel x --confirmation-message-hex",
+      "verify-x-funding-approval --wallet --pending-intent --pending-intent-key --approval-mode reply|self-contained --message|--message-hex --approval-tweet-id [--parent-tweet-id --reference-type replied_to] --x-user-id",
     ],
     invariant: "Every planner emits zero or one unsigned allowlisted transaction. This program never signs or submits.",
   });
@@ -1336,6 +1898,10 @@ async function main() {
     case "request": return await commandRequest();
     case "profit-status": return await commandProfitStatus();
     case "plan-open-pack": return await planOpenPack();
+    case "plan-open-pack-funding": return await planOpenPackFunding();
+    case "resume-open-pack-funding": return await resumeOpenPackFunding();
+    case "bind-x-funding-intent": return bindXIntent();
+    case "verify-x-funding-approval": return verifyXApproval();
     case "plan-revoke-usdc": return await planRevokeUsdc();
     case "plan-claim-prize": return await planClaimPrize();
     case "plan-expire-request": return await planExpireRequest();

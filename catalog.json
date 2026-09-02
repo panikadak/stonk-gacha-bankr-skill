@@ -5,16 +5,18 @@
   "providerUrl": "https://punk.town/#/gacha",
   "logo": "logo.svg",
   "demo": {
-    "title": "stonk-gacha-bankr-session.txt",
+    "title": "stonk-gacha-funded-open-v2.txt",
     "language": "text",
-    "code": "You:   Open a 10 USDC Stonk Gacha pack\nBankr: I checked the live Base deployment at one pinned block. I will show the current cash-backed ceiling, nominal RTP, eligible stock set, exact Pyth fee, and any exact USDC approval before asking you to continue. A win becomes a USDC purchase budget; the exact stock amount is known only after your later delivery swap.\nYou:   Continue\nBankr: The exact approval mined. I re-read the offer and fee instead of reusing the old plan. Here are the final terms for this one pack..."
+    "code": "You:   Open a 10 USDC Stonk Gacha pack\nBankr: You are short 8 USDC on Base. Stonk Gacha also needs separate native Base ETH for the exact Pyth fee. Eligible Base sources: 0.12 ETH or 1.0 WETH. Which source should I quote? I will not choose or lower the pack for you.\nYou:   Use WETH\nBankr: I bound Bankr's raw quoted output to the exact 8 USDC deficit and rejected excess sizing. Confirm this bounded sequence: spend at most the quoted WETH, include the shown exact-shortfall WETH-to-native top-up if needed, conditionally reset and approve exactly 10 USDC, then open pack 1 with the shown offer hash, ceiling, and native fee cap?\nYou:   Yes\nBankr: I will execute each confirmed step sequentially and recheck expiry, linked wallet, execution journal, request count, offer, fee, and native headroom before opening."
   },
   "setup": [
     "Install the skill from its public GitHub repository URL",
     "Use the active Bankr EVM wallet on Base; never paste or expose a private key",
     "Keep Wallet API read-write access and arbitrary contract calls enabled for writes",
     "Run the bundled live self-test once after install or update",
-    "Every write is planned as one unsigned transaction and verified after its mined receipt"
+    "Every protocol write is planned as one unsigned transaction and verified after its mined receipt",
+    "Funded quotes bind the response to.amount raw units to exact deficit or native-shortfall floors and reject oversized outputs",
+    "X approvals require trusted posted-text/channel metadata, replied_to parent binding, numeric identity, linked wallet, expiry, and atomic one-time consumption"
   ],
   "install": {
     "type": "bankr",

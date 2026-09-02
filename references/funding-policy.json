@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "network": {
+    "name": "Base",
+    "chainId": 8453,
+    "chainSlug": "base"
+  },
+  "walletApi": {
+    "baseUrl": "https://api.bankr.bot",
+    "portfolio": {
+      "method": "GET",
+      "path": "/wallet/portfolio?chains=base&showLowValueTokens=true"
+    },
+    "quote": {
+      "method": "POST",
+      "path": "/wallet/swap-quote"
+    },
+    "swap": {
+      "method": "POST",
+      "path": "/wallet/swap",
+      "idempotencyRequired": true
+    },
+    "nativeTokenSentinel": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "canonicalAssets": {
+    "usdc": {
+      "chain": "base",
+      "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "decimals": 6
+    },
+    "weth": {
+      "chain": "base",
+      "address": "0x4200000000000000000000000000000000000006",
+      "decimals": 18
+    },
+    "eth": {
+      "chain": "base",
+      "address": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "decimals": 18,
+      "native": true
+    }
+  },
+  "combinedOpen": {
+    "allowedSources": ["ETH", "WETH"],
+    "sourceChain": "base",
+    "intentTtlSeconds": 600,
+    "maximumIntentTtlSeconds": 900,
+    "defaultNativeHeadroomWei": "1500000000000000",
+    "minimumNativeHeadroomWei": "1500000000000000",
+    "maximumNativeHeadroomWei": "100000000000000000",
+    "requireSmallestQuoteCoveringDeficit": true,
+    "quoteRawBuyAmountField": "to.amount",
+    "quoteRawBuyAmountUnit": "destination token raw base units",
+    "requireExactDeficitOrShortfallFloor": true,
+    "rejectOversizedQuoteBeyondExplicitSlippage": true,
+    "requireExplicitNativeLegSlippage": true,
+    "allowAutomaticSourceSelection": false,
+    "allowAutomaticPackDowngrade": false,
+    "allowSwapCalldata": false,
+    "allowNaturalLanguageSwapPrompt": false
+  },
+  "crossChain": {
+    "countsAsBaseBalance": false,
+    "combinedWithOpen": false,
+    "requiresSeparateConfirmation": true,
+    "confirmationFields": [
+      "sourceChain",
+      "sourceToken",
+      "maximumSourceSpend",
+      "networkOrBridgeCost",
+      "minimumCanonicalBaseUsdcOutput"
+    ],
+    "missingNetworkOrBridgeCost": "fail-closed-without-confirmation"
+  },
+  "xConfirmation": {
+    "requiresDirectReplyMetadataForBareYes": true,
+    "requiresNumericUserId": true,
+    "requiresLinkedWalletMatch": true,
+    "requiresAtomicConsume": true,
+    "bindingRequiresTrustedPostedChannelAndExactText": true,
+    "replyReferenceType": "replied_to",
+    "rejectQuoteRepostOrGenericReference": true,
+    "approvalTweetIdMustDiffer": true,
+    "consumeRechecksExpiryAndLinkedWallet": true,
+    "everySwapRechecksExpiryWalletAndJournal": true,
+    "standaloneBareYes": "forbidden",
+    "missingParentFallback": "self-contained-exact-command"
+  }
+}
