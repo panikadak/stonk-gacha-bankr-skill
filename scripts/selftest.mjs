@@ -599,7 +599,7 @@ check("direct claim source proves Bankr execution and exact PackOpened request",
 check("direct claim source requires hidden preimage and receipt-anchored windows", plannerSource.includes("decodeDirectPullIntent(inspection.context.terms.directPullIntent)") && plannerSource.includes("bound open receipt mined outside its direct intent validity window") && plannerSource.includes("claim continuation window is not anchored exactly to the bound open receipt"));
 check("claim inspector rechecks canonical continuation", plannerSource.includes("decodeDirectClaimContinuation(terms.directClaimContinuation)") && plannerSource.includes("direct claim continuation failed the fresh pre-signing gate"));
 check("direct pull continuation has a bounded silent wait", plannerSource.includes("maximumSilentWaitSeconds: BANKR_EXECUTION.directPull.maximumSilentWaitSeconds"));
-check("successful delivery proof returns concise result fields", plannerSource.includes("purchaseBudgetUsdcFormatted") && plannerSource.includes("recordedStockOutFormatted") && plannerSource.includes('finalTemplate: "$PURCHASE_BUDGET_USDC USDC purchase of $SYMBOL arrived."'));
+check("successful delivery proof returns concise Gacha result fields", plannerSource.includes("payoutUsdcFormatted") && plannerSource.includes("recordedStockOutFormatted") && plannerSource.includes('finalTemplate: "You pulled $X of SYMBOL."'));
 check("offer reads do not expose RTP telemetry", !protocolSource.includes("nominalRtpBps") && !protocolSource.includes("effectiveRtpBps(uint256)"));
 check("successful deployment verification emits only a summary", plannerSource.includes("deploymentIntegrity: true") && plannerSource.includes("verifiedChecks: result.checks.length") && !plannerSource.includes("out({ ok: result.ok, command, wallet, ...result }"));
 const fundedResumePlannerSource = plannerSource.slice(
@@ -1220,13 +1220,13 @@ const frontmatter = skillMarkdown.match(/^---\n([\s\S]*?)\n---(?:\n|$)/)?.[1] ??
 equal("Bankr skill name", frontmatter.match(/^name:\s*(.+)$/m)?.[1]?.trim(), "stonk-gacha");
 check("Bankr skill description exists", /^description:\s*\S.+$/m.test(frontmatter));
 check("Bankr top-level tags exist", /^tags:\s*\[[^\]]+\]$/m.test(frontmatter));
-equal("Bankr top-level version", Number(frontmatter.match(/^version:\s*(\d+)$/m)?.[1]), 3);
+equal("Bankr top-level version", Number(frontmatter.match(/^version:\s*(\d+)$/m)?.[1]), 4);
 equal("Bankr top-level visibility", frontmatter.match(/^visibility:\s*(\S+)$/m)?.[1], "public");
 equal("catalog slug", catalog.slug, "stonk-gacha");
 equal("catalog schema", catalog.schemaVersion, 1);
 equal("catalog repo path", catalog.install.repoPath, ".");
 check("catalog points at public source", catalog.install.command.includes("github.com/panikadak/stonk-gacha-bankr-skill"));
-check("catalog demonstrates one-command delivered pull", catalog.demo.code.includes("Pull me a $10") && catalog.demo.code.includes("$20 USDC purchase of GOOGLc arrived.") && !catalog.demo.code.includes("Received"));
+check("catalog demonstrates one-command delivered Gacha pull", catalog.demo.code.includes("Pull me a $10") && catalog.demo.code.includes("You pulled $20 of GOOGLc.") && !catalog.demo.code.toLowerCase().includes("purchase"));
 check("skill requires silent open-to-delivery lifecycle", skillMarkdown.includes("Keep the entire workflow silent until completion") && skillMarkdown.includes("plan-claim-prize"));
 
 for (const relative of [

@@ -325,8 +325,8 @@ function silentPullContinuation(wallet) {
     maximumSilentWaitSeconds: BANKR_EXECUTION.directPull.maximumSilentWaitSeconds,
     requestCommand: `node scripts/stonk-gacha.mjs request --wallet ${wallet} --request-id REQUEST_ID`,
     readyCommand: `node scripts/stonk-gacha.mjs plan-claim-prize --wallet ${wallet} --request-id REQUEST_ID --claim-continuation CLAIM_CONTINUATION --claim-continuation-key CLAIM_CONTINUATION_KEY`,
-    rule: "After inspect-tx proves PackOpened, take REQUEST_ID, CLAIM_CONTINUATION, and CLAIM_CONTINUATION_KEY only from that output's postStateProof. Poll that exact request without user-facing updates. When Ready, run the exact continuation-bound same-wallet claim command, inspect calldata, submit once, and inspect its receipt. Fill the final template only from the delivery inspect-tx postStateProof.symbol and postStateProof.purchaseBudgetUsdcFormatted after currentStatus is Delivered. Never claim a different request, add recipient/slippage flags, relax the floor, or retry an ambiguous submission. If still Pending after the bounded wait, return only the pending request id.",
-    finalTemplate: "$PURCHASE_BUDGET_USDC USDC purchase of $SYMBOL arrived.",
+    rule: "After inspect-tx proves PackOpened, take REQUEST_ID, CLAIM_CONTINUATION, and CLAIM_CONTINUATION_KEY only from that output's postStateProof. Poll that exact request without user-facing updates. When Ready, run the exact continuation-bound same-wallet claim command, inspect calldata, submit once, and inspect its receipt. Fill X only from the delivery inspect-tx postStateProof.payoutUsdcFormatted and SYMBOL only from postStateProof.symbol after currentStatus is Delivered. Never claim a different request, add recipient/slippage flags, relax the floor, or retry an ambiguous submission. If still Pending after the bounded wait, return only the pending request id.",
+    finalTemplate: "You pulled $X of SYMBOL.",
   };
 }
 
@@ -1378,7 +1378,7 @@ async function planClaimPrize() {
     terms,
     report: silentDirect
       ? null
-      : `Spend request ${requestId}'s immutable ${formatUnits(BigInt(request.payoutUsdc), 6)} USDC purchase budget through its pinned route to deliver ${request.tokenMeta?.symbol ?? request.token} to ${recipient}?`,
+      : `Claim request ${requestId}'s ${formatUnits(BigInt(request.payoutUsdc), 6)} USDC Gacha payout as ${request.tokenMeta?.symbol ?? request.token} to ${recipient}?`,
     reads: silentDirect ? { requestStatus: request.status, quoteBlock: snapshot.number, sourceOpenProof } : { request, quoteBlock: snapshot.number, quoteStockOut: quote },
     warnings: silentDirect ? [] : ["A failed atomic call leaves the request Ready."],
     expectedEvents: ["PayoutExecuted", "PrizeDelivered", "exact USDC Transfer StonkGacha->GachaTreasury"],
@@ -2244,8 +2244,8 @@ async function postActionState(actionName, eventProof, context, receiptBinding =
     return {
       requestId: delivered.requestId,
       currentStatus: request.status,
-      purchaseBudgetUsdc: request.payoutUsdc,
-      purchaseBudgetUsdcFormatted: request.payoutUsdcFormatted,
+      payoutUsdc: request.payoutUsdc,
+      payoutUsdcFormatted: request.payoutUsdcFormatted,
       token: request.token,
       symbol: request.tokenMeta?.symbol ?? request.token,
       recordedStockOut: request.stockOut,

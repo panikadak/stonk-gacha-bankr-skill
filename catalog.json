@@ -5,9 +5,9 @@
   "providerUrl": "https://punk.town/#/gacha",
   "logo": "logo.svg",
   "demo": {
-    "title": "stonk-gacha-direct-pull-v3.txt",
+    "title": "stonk-gacha-direct-pull-v4.txt",
     "language": "text",
-    "code": "You:   Pull me a $10 Stonk Gacha pack\nBankr: $20 USDC purchase of GOOGLc arrived."
+    "code": "You:   Pull me a $10 Stonk Gacha pack\nBankr: You pulled $20 of GOOGLc."
   },
   "setup": [
     "Install the skill from its public GitHub repository URL",

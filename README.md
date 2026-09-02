@@ -1,7 +1,7 @@
 # Stonk Gacha Bankr Skill
 
 A deterministic, fail-closed Bankr skill for the live Stonk Gacha deployment on
-Base. Version 3 makes an already-funded pull silent and direct: exact approval,
+Base. Version 4 makes an already-funded pull silent and direct: exact approval,
 one open, asynchronous result polling, and default same-wallet prize delivery
 run under the user's original command. The scripts never store keys, sign,
 broadcast, or manufacture swap calldata.
@@ -69,7 +69,7 @@ waits for the request to become Ready, delivers the prize to the same wallet
 using the default nonzero output floor, and replies only after proof:
 
 ```text
-$20 USDC purchase of GOOGLc arrived.
+You pulled $20 of GOOGLc.
 ```
 
 Any funding trade, alternate recipient, custom slippage, changed terms, or

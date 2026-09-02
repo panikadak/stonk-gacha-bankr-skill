@@ -1,6 +1,6 @@
 {
   "name": "stonk-gacha-bankr-skill",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "description": "Deterministic Bankr wallet planner and verifier for Stonk Gacha on Base",
   "type": "module",

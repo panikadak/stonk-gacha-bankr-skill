@@ -63,7 +63,7 @@ to the exact Bankr execution, `PackOpened` request id, wallet, source intent,
 same-wallet recipient, and 300 bps policy. When that exact request becomes
 `Ready`, pass only that continuation and key to `plan-claim-prize`. The planner
 and calldata inspector re-prove the source receipt before silent submission.
-After delivery proof, return only `$X USDC purchase of SYMBOL arrived`.
+After delivery proof, return only `You pulled $X of SYMBOL.`
 
 For writes that are not already authorized by that direct lifecycle, present
 only the essential decision fields:
