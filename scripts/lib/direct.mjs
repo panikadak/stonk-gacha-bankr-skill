@@ -366,7 +366,7 @@ export function directClaimContinuationKey(continuation) {
   return keccak256(canonicalBytes(validateDirectClaimContinuation(continuation)));
 }
 
-export function assessDirectClaimContinuation(continuationValue, fresh) {
+export function assessDirectClaimContinuation(continuationValue, fresh, options = {}) {
   const continuation = validateDirectClaimContinuation(continuationValue);
   const issues = [];
   const compare = (condition, code, detail) => {
@@ -379,7 +379,9 @@ export function assessDirectClaimContinuation(continuationValue, fresh) {
   compare(wallet === continuation.wallet, "wallet-changed", "active wallet differs from the direct claim continuation");
   compare(BigInt(fresh.requestId) === BigInt(continuation.requestId), "request-changed", "request id differs from the receipt-bound continuation");
   compare(BigInt(fresh.timestamp) >= BigInt(continuation.createdAt), "not-yet-valid", "direct claim continuation creation time is in the future");
-  compare(BigInt(fresh.timestamp) < BigInt(continuation.expiresAt), "expired", "direct claim continuation expired");
+  if (options.allowExpired !== true) {
+    compare(BigInt(fresh.timestamp) < BigInt(continuation.expiresAt), "expired", "direct claim continuation expired");
+  }
   compare(recipient === continuation.deliveryPolicy.recipient, "recipient-changed", "claim recipient differs from the direct claim continuation");
   compare(Number(fresh.slippageBps) === continuation.deliveryPolicy.slippageBps, "slippage-changed", "claim slippage differs from the direct claim continuation");
   return { ok: issues.length === 0, issues };

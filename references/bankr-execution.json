@@ -23,8 +23,15 @@
     "scopeReceiptLogsToSelectedUserOperation": true
   },
   "directPull": {
+    "orchestrator": "scripts/pull.mjs",
+    "stateSchemaVersion": 2,
+    "maximumUnsignedTransactionsPerOutput": 1,
+    "stateWrittenBeforeTransactionOutput": true,
+    "compactStateHomeDirectory": ".stonk-gacha/pulls",
+    "compactStateLockStaleSeconds": 300,
+    "maximumAutomaticProvenRevertRetriesPerPhase": 1,
     "maximumEntropyFeeWei": "10000000000000",
-    "intentTtlSeconds": 600,
+    "intentTtlSeconds": 7200,
     "claimContinuationTtlSeconds": 172800,
     "pollIntervalSeconds": 2,
     "activeWatchSeconds": 300,

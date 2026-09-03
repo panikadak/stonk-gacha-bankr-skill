@@ -553,7 +553,7 @@ export function userOperationHashCall(envelope) {
   return `${GET_USER_OP_HASH_SELECTOR}${encodeUint(WORD_BYTES)}${strip0x(envelope.userOperation.encodedTuple)}`;
 }
 
-export function verifyBankrExecutionReceipt(envelope, receipt, expectedUserOpHash = null) {
+export function verifyBankrExecutionReceipt(envelope, receipt, expectedUserOpHash = null, options = {}) {
   if (envelope.mode === "direct-wallet-transaction") return null;
   if (typeof expectedUserOpHash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(expectedUserOpHash)) {
     fail("sponsored receipt verification requires the EntryPoint-computed userOpHash");
@@ -580,7 +580,9 @@ export function verifyBankrExecutionReceipt(envelope, receipt, expectedUserOpHas
   if (nonce !== envelope.userOperation.nonce) fail("UserOperationEvent nonce does not match the submitted user operation");
   const success = uintWord(data, WORD_BYTES, "UserOperationEvent success");
   if (success !== 0n && success !== 1n) fail("UserOperationEvent success is not a canonical bool");
-  if (success !== 1n) fail("Bankr user operation was included but its logical call reverted");
+  if (success !== 1n && options.allowReverted !== true) {
+    fail("Bankr user operation was included but its logical call reverted");
+  }
 
   const beforeExecutionIndices = [];
   const userOperationEventIndices = [];
@@ -612,7 +614,7 @@ export function verifyBankrExecutionReceipt(envelope, receipt, expectedUserOpHas
     userOpHash: canonicalHash,
     sender,
     nonce,
-    success: true,
+    success: success === 1n,
     actualGasCost: uintWord(data, 2 * WORD_BYTES, "UserOperationEvent actualGasCost"),
     actualGasUsed: uintWord(data, 3 * WORD_BYTES, "UserOperationEvent actualGasUsed"),
     bundleIndex: envelope.userOperation.index,

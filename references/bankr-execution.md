@@ -1,7 +1,8 @@
 # Bankr execution and recovery
 
-Read this before the first Stonk Gacha write in every session. The local scripts
-prepare and validate unsigned Base transactions; Bankr alone signs and
+This is the advanced execution and recovery reference. The normal already-
+funded pull uses `scripts/pull.mjs` and does not need to load this file. Local
+scripts prepare and validate unsigned Base transactions; Bankr alone signs and
 broadcasts them.
 
 ## Resolve the active wallet
@@ -18,6 +19,21 @@ receipt inspection to match it.
   it may be a relayer. `inspect-tx` proves the inner logical call.
 - Do not place credentials in command arguments, logs, issues, repository
   files, or chat.
+
+## Compact direct path
+
+For a current exact pull request, run:
+
+```bash
+node scripts/pull.mjs start --wallet 0xActiveBankrEvmWallet --amount-usdc 10
+```
+
+Submit only its single `txs[0]`, wait for confirmation, put the returned hash
+into its exact `next` command, and continue. The wrapper internally performs
+the planner, fresh calldata inspection, receipt proof, request-bound watcher,
+and claim preparation described below. It atomically persists each submitting
+phase before releasing its transaction. Do not repeat those internal commands
+as extra Bankr steps and do not rerun `start` to obtain a transaction again.
 
 ## First-use gate
 
@@ -37,13 +53,10 @@ fails. A deployment-pin change requires a reviewed skill update.
 
 ## Reconcile unfinished pulls first
 
-At the start of every Stonk Gacha skill invocation, resolve the active wallet
-and reconcile its nonterminal records under `/stonk-gacha/pulls/8453/` before
-planning another write. Follow
-[runtime-journal.md](runtime-journal.md). Onchain request state is truth, an
-exact unexpired receipt-bound continuation is silent claim authority, and a
-journal record is only a private resume hint. This reconciliation stays out of
-the user-facing conversation.
+`pull.mjs start` validates and reconciles compact records under
+`~/.stonk-gacha/pulls/8453/` before planning another write. Follow
+[runtime-journal.md](runtime-journal.md) for manual recovery. Onchain state and
+exact receipts remain truth; reconciliation stays out of the conversation.
 
 ## Plan and authorize
 
@@ -58,29 +71,12 @@ Run the relevant `plan-*` command. Treat its stdout as one JSON document:
   planner against fresh state;
 - `next`: the fresh read or planner step expected after success.
 
-For a normal pack open, a current explicit command naming one exact pack amount
-is the authorization. Pass that amount as `--authorized-price-usdc`; the
-deployed pack index must map to exactly that price. When the active wallet
-already has sufficient Base USDC and native ETH, do not show preflight,
-balances, offer details, fees, approval phases, or progress and do not ask
-again. Persist the emitted direct intent/key, submit each planner phase
-sequentially, rerun after approvals with that exact intent, and require its
-short expiry plus unchanged request-count baseline before every signature.
-The opaque intent also holds a fresh claim-capability preimage whose
-domain-separated Keccak commitment is the open's onchain user-random input;
-never expose it conversationally or accept a replacement from public data.
-
-After the open receipt proves the new request, `inspect-tx` emits a claim
-continuation bound to the exact Bankr execution, `PackOpened` request id,
-wallet, source intent, same-wallet recipient, and 300 bps policy. Immediately
-persist the complete request record described in `runtime-journal.md`, then run
-`await-claim-prize` with that exact request, continuation, and key. The
-pre-open intent remains bounded to 600 seconds. The receipt-bound delivery
-authorization is bounded to 172800 seconds so a Bankr process interruption does
-not erase the exact request's delivery authority; each emitted claim
-transaction still has a fresh 600-second deadline. The planner and calldata
-inspector re-prove the source receipt before silent submission. After delivery
-proof, return only `You pulled $X of SYMBOL.`
+For a normal pack open, use the compact path above. A current explicit command
+naming one exact pack amount is its authorization. The wrapper selects only the
+deployed pack whose fresh price equals that amount, privately persists the
+intent and receipt-bound continuation, and rechecks the unchanged request-count
+baseline before open. Keep all intermediate output private and return only its
+proved `finalMessage`.
 
 For writes that are not already authorized by that direct lifecycle, present
 only the essential decision fields:
@@ -157,16 +153,16 @@ Use the runtime's protected authentication mechanism; never generate a command
 containing a real key. Submit one transaction at a time. Never parallelize an
 approval with its dependent action, and never replay a stale plan.
 
-Before an authorized silent claim submission, transition its exact runtime record from
-`awaiting-settlement` or `ready` to `claim-submitting` and retain the planner's
-opaque inspection context/key for receipt recovery. Record the returned
-transaction hash before receipt polling. A missing hash or unknown outcome
-requires state and Bankr Activity reconciliation; it is never permission to
-submit again. See `runtime-journal.md`.
+The compact wrapper transitions the exact record to `claim-submitting` and
+retains its opaque inspection binding before returning the claim transaction.
+A missing hash or unknown outcome requires Bankr Activity reconciliation; it
+is never permission to request or submit another claim. See
+`runtime-journal.md`.
 
 ## Await one exact authorized claim
 
-After the open receipt is proven and journaled, use:
+The compact wrapper invokes the following low-level watcher internally. Use it
+directly only for advanced recovery:
 
 ```bash
 node scripts/stonk-gacha.mjs await-claim-prize \
@@ -404,7 +400,8 @@ or permission to change the planned call.
 
 ## Receipt and postcondition gate
 
-After Bankr returns a transaction hash:
+The compact wrapper invokes receipt inspection internally after Bankr returns
+a hash. For an advanced or manual flow:
 
 ```bash
 node scripts/stonk-gacha.mjs inspect-tx \
@@ -424,12 +421,15 @@ dependent phase:
 5. the operation-specific fresh read in `operations.md` proves the new state;
 6. exact token balance and allowance changes are proven where applicable.
 
-A pending, unavailable, reverted, or ambiguous transaction is not permission to
-retry. Recover from its hash and fresh Base state. If receipt or postcondition
-proof remains incomplete, report "submitted but unverified," include the hash,
-and stop. For a direct pull, keep that state private in its resume record and
-continue reconciliation; do not replace the final pull result with this generic
-status.
+A pending, unavailable, merely reported failed, or ambiguous transaction is not
+permission to retry. Recover its exact hash and fresh Base state. Only when the
+compact wrapper proves the exact persisted logical call, Bankr envelope, mined
+revert, receipt-block deployment, and inspection binding may it create one fresh
+automatic retry for that phase. A second proven revert in the same phase emits
+no transaction. If receipt or postcondition proof remains incomplete, report
+"submitted but unverified," include the hash, and stop. For a direct pull, keep
+that state private in its resume record and continue reconciliation; do not
+replace the final pull result with this generic status.
 
 `/wallet/submit` has no documented idempotency field. For an ambiguous approval,
 reconcile Bankr Activity/nonce and the current USDC allowance before any resend.

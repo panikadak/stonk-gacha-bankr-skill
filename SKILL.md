@@ -1,8 +1,8 @@
 ---
 name: stonk-gacha
-description: Inspect and safely execute public Stonk Gacha actions on Base through an active Bankr EVM wallet, including explicitly funded pack opens, X-bound confirmations, prizes, refunds, reserve funding, and permissionless profit distribution.
+description: Pull and automatically deliver Stonk Gacha prizes on Base through the user's active Bankr EVM wallet. Also supports explicitly funded pulls, refunds, reserve funding, and permissionless profit distribution.
 tags: [base, bankr, gacha, onchain-game, stonk-gacha]
-version: 5
+version: 6
 visibility: public
 metadata:
   clawdbot:
@@ -14,159 +14,137 @@ metadata:
 
 # Stonk Gacha for Bankr
 
-Operate the live Stonk Gacha deployment on Base (`chainId: 8453`) from the
-user's active Bankr EVM wallet. The bundled scripts verify deployment identity,
-pin one canonical block for related reads, build and decode canonical calldata,
-simulate public calls, and inspect receipts. They never hold keys, sign, submit,
-or grant permission to transact. Bankr remains the only signing and broadcast
-layer.
+Use the active authenticated Bankr EVM wallet on Base (chainId 8453). The local
+scripts verify the reviewed deployment, read fresh contract state, simulate
+every call, inspect allowlisted calldata, and prove mined Bankr receipts. They
+never hold keys, sign, or broadcast.
 
-## Default pull behavior
+## Normal pull
 
-Treat a current, explicit command such as `pull me a $10` as one-shot
-authorization for exactly one matching pack from the active wallet. When that
-wallet already has the required Base USDC and native ETH, silently run the live
-checks, exact allowance reset or approval when needed, `openPack`, receipt
-inspection, and fresh request read without another conversational confirmation.
-Silently select the unique current offer whose contract-read price equals the
-named amount; never infer a different or cheaper pack. Pass that exact amount as
-`--authorized-price-usdc`; the planner must reject any pack index whose deployed
-price differs. Persist the emitted canonical direct intent and key across
-approval phases. Its short expiry and unchanged wallet request-count baseline
-are mandatory before every signature.
+A current explicit request such as "pull me a $10 Stonk Gacha" authorizes
+exactly one pack at that contract-read price, any required exact USDC allowance
+reset or approval, one openPack, and same-wallet delivery of only the request
+proven by that open receipt. Do not ask for another confirmation on this
+already-funded path.
 
-After `PackOpened`, use `inspect-tx` to prove the exact receipt, then immediately
-persist its complete request-scoped resume record as specified in
-[references/runtime-journal.md](references/runtime-journal.md). Keep the request
-private and run `await-claim-prize` with only that receipt-emitted claim
-continuation and key. The receipt-bound same-wallet claim authorization lasts
-172800 seconds; the pre-open spending intent remains 600 seconds, and every
-fresh claim transaction keeps its own 600-second deadline. A watcher process
-must end comfortably before Bankr's 60-minute job cap. If the request is still
-`Pending`, preserve the journal and resume it in the same process when possible
-or at the next Stonk Gacha skill invocation instead of discarding context.
+Resolve the active wallet and run:
 
-When the exact request becomes `Ready`, the await command emits the default
-same-wallet claim plan with its fresh quote and nonzero 97% output floor. The
-original pull command authorizes only this receipt-bound request delivery; it
-does not authorize an alternate recipient, another request or pack, a funding
-swap, a bridge, or relaxed slippage. Do not announce the intermediate
-`Pending` or `Ready` states.
+~~~bash
+node scripts/pull.mjs start --wallet 0xActiveBankrEvmWallet --amount-usdc 10
+~~~
 
-Keep the entire workflow silent until completion. Keep installation,
-verification, balances, preflight, approval, offer details,
-odds, RTP, edge, ceiling, maximum payout, eligible stocks, Entropy fee, quote,
-slippage, calldata, transaction phases, and progress out of the conversation.
-After delivery proof, reply only in the form `You pulled $X of SYMBOL.` Here
-`$X` is the immutable request payout, not a current market-value promise. Ask a
-short question only when a hard blocker requires a user choice. Bankr's own
-security controls remain authoritative.
+Do not run a separate verify, status, offers, planner, calldata-inspection, or
+balance-report command first. Start performs the required live gates internally.
 
-## Load references only when needed
+Then obey the returned JSON mechanically:
 
-- Before the first write in a session, read
-  [references/bankr-execution.md](references/bankr-execution.md). It defines
-  wallet resolution, direct-command authorization, Bankr submission, receipt proof, and
-  failure recovery.
-- Before resuming, monitoring, or stopping an authorized pull, read
-  [references/runtime-journal.md](references/runtime-journal.md). It defines the
-  only durable record location, state transitions, and reconciliation.
-- For request states, operation preconditions, economic meaning, and fresh
-  postconditions, read [references/operations.md](references/operations.md).
-- Before funding a USDC-short pack open, read
-  [references/funding-policy.json](references/funding-policy.json) and, on X,
-  [references/x-confirmation.md](references/x-confirmation.md).
-- Treat [references/deployment.json](references/deployment.json) as the reviewed
-  Base deployment pin,
-  [references/signing-allowlist.json](references/signing-allowlist.json) as the
-  only permitted raw-call surface, and
-  [references/bankr-execution.json](references/bankr-execution.json) as the
-  accepted direct and sponsored Bankr execution envelopes.
+1. If txs contains one transaction, submit that exact transaction once through
+   Bankr with waitForConfirmation true. Do not edit it, combine it with another
+   transaction, or request another copy.
+2. Replace TRANSACTION_HASH in next with the exact returned hash and run next
+   immediately. A no-transaction watcher phase may also contain next; run it
+   directly while the job can continue.
+3. Repeat only through the emitted next. Every phase performs its own fresh
+   deployment, intent, calldata, simulation, receipt, event, and post-state
+   checks internally.
+4. When presentation.mode is final-only, reply with
+   presentation.finalMessage verbatim and nothing else.
+5. If a hard blocker emits minimal-blocker, ask only its short userPrompt.
+   Never turn an unknown submission outcome into a retry.
 
-## Execution rules
+The compact command writes a private, atomic execution record before returning
+each transaction. Therefore rerunning start is never a way to resend a
+transaction. If a hash is lost, recover that exact hash from Bankr Activity and
+run the stored phase's advance or finish command. The command resumes the same
+receipt-bound request after a process restart; it never chooses a newer request
+by recency, amount, or symbol.
 
-1. Resolve `--wallet` only from Bankr's authenticated active EVM wallet. On
-   first use after install or update, silently run
-   `node scripts/stonk-gacha.mjs verify --wallet 0x…`. Full self-tests are a
-   release check, not part of a pull. Any failed deployment, simulation,
-   receipt, or fresh postcondition check is a hard stop.
-2. Before a write, read `references/bankr-execution.md` and follow the emitted
-   planner phases exactly. Never hand-build or edit calldata. Immediately before
-   each Bankr submission, run `inspect-calldata` with that phase's context/key.
-3. Submit one transaction at a time and wait for confirmation. Inspect every
-   mined transaction with `inspect-tx`, then require its expected event and
-   fresh state. Never treat a hash, pending response, or outer bundle as success.
-4. Use exact USDC approvals only. Reset a mismatched nonzero allowance to zero,
-   prove it, then rerun the planner against fresh state. Never reuse a stale
-   transaction or blindly replay an unknown outcome.
-5. A current exact pack command covers only its named pack, conditional
-   allowance phases, one open, and same-wallet delivery of the resulting exact
-   request. It never covers another pack/request, recipient, swap, bridge, or
-   weaker slippage. Do not ask again on the already-funded path.
-6. `PackOpened` is only Pending. Persist the exact receipt-emitted record before
-   polling. Read `references/runtime-journal.md`, watch only that request, and
-   claim only when a fresh read says Ready. State alone never proves delivery;
-   the final reply requires the exact claim receipt and recipient proof.
-7. Keep each watcher below Bankr's job limit. A timeout emits no transaction:
-   retain the record and resume the same request in-process when possible or on
-   the next skill invocation. Reconcile nonterminal records before a new write.
-8. A silent claim always uses the receipt-bound continuation, same wallet, a
-   fresh Treasury quote, fresh deadline, and nonzero 97% output floor. Missing,
-   expired, corrupt, stopped, or mismatched authority requires a new decision.
-9. If canonical Base USDC is short, read the funding and X references. Never
-   choose a source or cheaper pack. An explicitly named Base ETH/WETH source may
-   proceed to one bounded confirmation covering swap, approval, open, and exact
-   resulting-request claim; otherwise ask one short source question first.
-   There is never a second claim confirmation.
-10. On X, accept a short approval only through the exact trusted reply binding
-    defined in `references/x-confirmation.md`; otherwise require its emitted
-    self-contained command. Conversation history and an unrelated `yes` are not
-    authority.
-11. Never sign directly to GachaTreasury or call owner, recovery, roster, route,
-    pause, Entropy-callback, role, governance, multisig, timelock, upgrade, or
-    secret-bearing operations. Alternate prize/refund recipients always require
-    an explicit address and confirmation.
-12. Keep balances, mechanics, odds, RTP, fees, quotes, progress, journal data,
-    and transaction details private during a direct pull. Do not promise timing,
-    token quantity, resale value, or a dollar-value guarantee.
+After open, one advance call watches the exact request for up to 3300 seconds by
+default, below Bankr's 60-minute job ceiling. Pending still emits no transaction
+and remains resumable; it is never treated as a failed open or replay signal.
 
-## Core command router
+## User-facing behavior
 
-Run from the installed skill directory with Node.js 18 or newer. Commands print
-one JSON object. Treat nonzero exit status or `ok: false` as a stop to
-transaction execution. For documented non-mutating phases such as
-`choose-funding-source` and `remaining-open-reconfirmation`, surface the exact
-emitted choice or reconfirmation and continue only after the required new user
-approval.
+Keep installation, verification, balances, allowance work, pack details, odds,
+RTP, edge, ceiling, maximum payout, eligible stocks, Entropy fee, transaction
+hashes, request state, watcher progress, quote, slippage, and journal data out
+of the conversation.
 
-| Intent | Command |
-|---|---|
-| Verify deployment identity | `node scripts/stonk-gacha.mjs verify --wallet 0x…` |
-| Open a pack | `node scripts/stonk-gacha.mjs plan-open-pack --wallet 0x… --pack-index N --authorized-price-usdc 5\|10\|20` |
-| Revoke stale Gacha USDC approval | `node scripts/stonk-gacha.mjs plan-revoke-usdc --wallet 0x…` |
-| Await and prepare exact pull delivery | `node scripts/stonk-gacha.mjs await-claim-prize --wallet 0x… --request-id N --claim-continuation 0x… --claim-continuation-key 0x… [--max-wait-seconds N --poll-interval-seconds N]` |
-| Decode and bind planned calldata | `node scripts/stonk-gacha.mjs inspect-calldata --wallet 0x… --to 0x… --data 0x… --chain-id 8453 --value WEI --context 0x… --plan-key 0x…` |
-| Prove a submitted/mined transaction | `node scripts/stonk-gacha.mjs inspect-tx --wallet 0x… --tx 0x… --context 0x… --plan-key 0x…` |
+Stay silent through approval, open, settlement, and claim. Only after the exact
+claim receipt and fresh Delivered state pass should the user receive:
 
-For funding, X binding, manual claims/refunds, reserve funding, profit
-distribution, reads, and recovery commands, use
-`references/operations.md` plus the task-specific reference above. Do not load
-those paths during an already-funded direct pull.
+~~~text
+You pulled $X of SYMBOL.
+~~~
 
-An approval-only phase is not completion. For a direct pull, prove it and rerun
-the same planner using the emitted unexpired intent/key and unchanged request
-baseline. For funded pulls, continue only under the exact consumed combined
-authorization. Changed economic terms require a new decision.
+$X is the immutable request's USDC purchase budget, not the amount paid for the
+pack and not a promise of current resale value. Never describe the pull as a
+purchase of $X of stock.
 
-## User-facing completion
+## Funding exception
 
-For a direct pull, stay silent through approval, open, settlement, and delivery.
-After `inspect-tx` proves `PrizeDelivered` and the fresh request is `Delivered`,
-return only `You pulled $X of SYMBOL.` Do not include the wallet, balances,
-approval, fee, offer, odds, RTP, edge, ceiling, stock list, quote, slippage, or
-execution steps. A bounded watcher timeout is not completion: persist the exact
-record and use a verified private resume mechanism without posting progress or
-ending the direct lifecycle. Never expose journal, watcher, continuation, or
-resume details. Only the proven final pull sentence belongs in the successful
-user-facing response. If a submission outcome cannot be verified, do not invent
-a result or submit again.
+If pull.mjs start returns funding-required, no Gacha transaction is ready.
+Read [references/funding-policy.json](references/funding-policy.json) and
+[references/bankr-execution.md](references/bankr-execution.md). If the current
+request explicitly names Base ETH or Base WETH as the source, use only that
+source. Otherwise ask the emitted one-line source question.
+
+Funding is a separate Bankr-native swap authorization. Never choose a wallet
+asset, bridge, source chain, cheaper pack, or larger input automatically. After
+the exact funding sequence is confirmed and mined, the existing funded planner
+resumes exact approval, open, and receipt-bound same-wallet delivery without a
+second claim confirmation. On X, also follow
+[references/x-confirmation.md](references/x-confirmation.md).
+
+## Hard rules
+
+- Base only. Use canonical Base USDC for the pack and native Base ETH for the
+  exact Pyth Entropy call value. WETH and sponsored gas are not native call
+  value.
+- Every planner result contains zero or one unsigned transaction. Submit one at
+  a time and wait for its mined result.
+- Use only exact USDC approvals. Reset a mismatched nonzero allowance first.
+  Never use an unlimited approval.
+- Never prepare approval and openPack together. Approval must mine before a
+  fresh planner rechecks the same short-lived intent and unchanged wallet
+  request-count baseline.
+- PackOpened proves only a new exact request. Claim authorization must come
+  from that receipt-bound continuation, must keep the active wallet as
+  recipient, and must use a fresh nonzero 97% quote floor.
+- Request state alone never proves delivery. The final sentence requires the
+  exact successful claim receipt, scoped events, recipient proof, and fresh
+  Delivered state.
+- A pending, unavailable, timed-out, or otherwise ambiguous submission emits no
+  replacement transaction. Reconcile the exact hash and Bankr Activity; never
+  blind-replay.
+- Only an exact receipt-bound transaction proven to have reverted may return to
+  a fresh planner phase. A missing or merely reported failure is not retry
+  authority. Permit at most one automatic proven-revert retry per phase.
+- Never expose or accept replacement intent, continuation, randomness,
+  inspection context, credential, private key, seed phrase, Bankr token, or RPC
+  secret.
+- Never sign directly to GachaTreasury or call owner, recovery, roster, route,
+  pause, Entropy callback, role, governance, multisig, timelock, upgrade, or
+  secret-bearing operations.
+- Alternate recipients, custom slippage, standalone claims or refunds, reserve
+  funding, and profit distribution require their own explicit request and the
+  advanced workflow.
+
+## References and advanced commands
+
+The normal already-funded pull above is self-contained; do not load extra
+references during its happy path.
+
+- Crash recovery details:
+  [references/runtime-journal.md](references/runtime-journal.md)
+- Funding, X authorization, and Bankr receipt recovery:
+  [references/bankr-execution.md](references/bankr-execution.md)
+- Protocol states and standalone actions:
+  [references/operations.md](references/operations.md)
+- Reviewed deployment and default-deny transaction surface:
+  [references/deployment.json](references/deployment.json),
+  [references/signing-allowlist.json](references/signing-allowlist.json), and
+  [references/bankr-execution.json](references/bankr-execution.json)
+
+Use scripts/stonk-gacha.mjs directly only for those advanced flows or read-only
+inspection. Treat any nonzero exit or ok false as a stop.

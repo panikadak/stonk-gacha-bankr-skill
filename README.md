@@ -1,11 +1,12 @@
 # Stonk Gacha Bankr Skill
 
 A deterministic, fail-closed Bankr skill for the live Stonk Gacha deployment on
-Base. An already-funded pull is silent and direct: exact approval, one open, an
-exact-request result watcher, and default same-wallet prize delivery run under
-the user's original command. A private request record preserves safe recovery
-if the Bankr process stops. The scripts never store keys, sign, broadcast, or
-manufacture swap calldata.
+Base. An already-funded pull is silent and direct: one compact start/advance/
+finish loop handles exact approval, one open, an exact-request watcher, and
+same-wallet prize delivery under the user's original command. A private atomic
+record is written before every transaction is returned, so a restart resumes
+the same pull without blindly replaying it. The scripts never store keys, sign,
+broadcast, or manufacture swap calldata.
 
 ## Install in Bankr
 
@@ -72,6 +73,17 @@ confirmation. Bankr submits any exact approval phase, opens one matching pack,
 waits or privately resumes until the exact request becomes Ready, delivers the
 prize to the same wallet using a fresh nonzero output floor, and replies only
 after proof:
+
+```bash
+node scripts/pull.mjs start \
+  --wallet 0xYourActiveBankrEvmWallet \
+  --amount-usdc 10
+```
+
+The command returns at most one transaction plus the exact `next` command.
+Bankr submits that transaction once, waits for its hash, and follows `next`.
+Planner, calldata, receipt, event, watcher, and final delivery checks happen
+inside the compact commands instead of consuming separate agent steps.
 
 ```text
 You pulled $20 of GOOGLc.
@@ -169,8 +181,8 @@ node scripts/stonk-gacha.mjs requests --wallet 0xYourActiveBankrEvmWallet
 ```
 
 The user's current explicit action command is the authorization; planner output
-alone is not. Bankr must preserve the exact planned transaction and pass both
-`inspect-calldata` and `inspect-tx`.
+alone is not. The compact path preserves the exact planned transaction and runs
+both calldata and receipt inspection internally.
 
 ## License
 

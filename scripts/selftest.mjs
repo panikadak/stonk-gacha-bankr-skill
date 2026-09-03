@@ -546,6 +546,11 @@ const wrongRequestClaim = assessDirectClaimContinuation(directClaimContinuation,
 check("direct claim cannot select another Ready request", !wrongRequestClaim.ok && wrongRequestClaim.issues.some(({ code }) => code === "request-changed"));
 const expiredDirectClaim = assessDirectClaimContinuation(directClaimContinuation, { ...directClaimFresh, timestamp: directCreatedAt + DIRECT_CLAIM_TTL_SECONDS });
 check("direct claim continuation expiry is exclusive", !expiredDirectClaim.ok && expiredDirectClaim.issues.some(({ code }) => code === "expired"));
+check("terminal-state recovery may validate an expired continuation without renewing claim authority", assessDirectClaimContinuation(
+  directClaimContinuation,
+  { ...directClaimFresh, timestamp: directCreatedAt + DIRECT_CLAIM_TTL_SECONDS },
+  { allowExpired: true },
+).ok);
 const futureDirectClaim = assessDirectClaimContinuation(directClaimContinuation, { ...directClaimFresh, timestamp: directCreatedAt - 1n });
 check("direct claim cannot start before creation", !futureDirectClaim.ok && futureDirectClaim.issues.some(({ code }) => code === "not-yet-valid"));
 const changedRequestContinuation = structuredClone(directClaimContinuation);
@@ -720,6 +725,20 @@ check("semantic RpcError is not retryable transport exhaustion", !isRetryableRpc
 // because the command is a process entrypoint rather than an importable module.
 const plannerSource = readFileSync(new URL("./stonk-gacha.mjs", import.meta.url), "utf8");
 const protocolSource = readFileSync(new URL("./lib/protocol.mjs", import.meta.url), "utf8");
+const compactPullSource = readFileSync(new URL("./pull.mjs", import.meta.url), "utf8");
+const pullStateSource = readFileSync(new URL("./lib/pull-state.mjs", import.meta.url), "utf8");
+check("compact pull routes start advance and finish", compactPullSource.includes('start: ["wallet", "amount-usdc"') && compactPullSource.includes('advance: ["wallet", "pull-id"') && compactPullSource.includes('finish: ["wallet", "pull-id"'));
+check("compact pull internally inspects every planned calldata", compactPullSource.includes('"inspect-calldata"') && compactPullSource.includes("function inspectPlan"));
+check("compact pull internally proves every submitted receipt", compactPullSource.includes('"inspect-tx"') && compactPullSource.includes("function inspectReceipt"));
+check("compact pull recovers exact externally delivered receipt", compactPullSource.includes('"inspect-delivered-tx"') && compactPullSource.includes("function inspectDeliveredReceipt"));
+check("compact pull serializes wallet-scoped starts", compactPullSource.includes("withWalletPullLock(wallet") && pullStateSource.includes("function withWalletPullLock"));
+check("compact pull rejects a planner superseded by any wallet record change", compactPullSource.includes("walletPullGeneration(wallet) !== discoveredGeneration") && compactPullSource.includes('phase: "superseded"') && pullStateSource.includes("export function walletPullGeneration"));
+check("compact pull retries only a persisted proven reverted phase", compactPullSource.includes('receipt.phase === "proven-reverted"') && compactPullSource.includes('stage: "preopen-reverted"') && plannerSource.includes('phase: "proven-reverted"'));
+check("compact pull emits at most one transaction", compactPullSource.includes("txs: [tx]") && !compactPullSource.includes("txs: [approval, open"));
+check("compact pull final output is receipt-derived only", compactPullSource.includes('proof?.currentStatus === "Delivered"') && compactPullSource.includes("finalMessage: proof.finalMessage"));
+check("compact pull persists before returning a transaction", compactPullSource.indexOf("createPullRecord(record)") < compactPullSource.indexOf("return submittingOutput(record, prepared.tx)") && compactPullSource.includes("const updated = persistPlan(record, prepared)"));
+check("compact pull never signs or submits", !/privateKey|seedPhrase|wallet\/submit|sendTransaction/.test(compactPullSource));
+check("compact state uses atomic durable replacement", pullStateSource.includes("fsyncSync(descriptor)") && pullStateSource.includes("renameSync(temporary, recordPath)") && pullStateSource.includes("pull authorization cannot change"));
 check("planner uses Node CSPRNG", plannerSource.includes("randomBytes(32)"));
 const normalOpenPlannerSource = plannerSource.slice(
   plannerSource.indexOf("async function planOpenPack()"),
@@ -1213,6 +1232,10 @@ rejects("reject wrong userOp hash", () => verifyBankrExecutionReceipt(sponsoredE
 rejects("reject failed logical operation", () => verifyBankrExecutionReceipt(sponsoredEnvelope, {
   logs: [boundary, userOperationEvent(ENTRY_POINT_V07, wallet, v07Nonce, userOpHash, false)],
 }, userOpHash), "logical call reverted");
+const provenRevertedUserOperation = verifyBankrExecutionReceipt(sponsoredEnvelope, {
+  logs: [boundary, userOperationEvent(ENTRY_POINT_V07, wallet, v07Nonce, userOpHash, false)],
+}, userOpHash, { allowReverted: true });
+check("explicit reverted-receipt mode preserves a failed logical operation proof", provenRevertedUserOperation.success === false);
 rejects("reject missing execution boundary", () => verifyBankrExecutionReceipt(sponsoredEnvelope, { logs: [successEvent] }, userOpHash), "BeforeExecution boundary");
 rejects("reject noncanonical receipt bool", () => verifyBankrExecutionReceipt(sponsoredEnvelope, {
   logs: [{ ...boundary }, { ...successEvent, data: `0x${encodeUint(v07Nonce)}${encodeUint(2n)}${encodeUint(123n)}${encodeUint(456n)}` }],
@@ -1408,7 +1431,14 @@ equal("direct pull maximum active watch", BANKR_EXECUTION.directPull.maximumActi
 equal("direct pull transport error cap", BANKR_EXECUTION.directPull.maximumConsecutiveTransportErrors, 8);
 equal("direct pull transport backoff cap", BANKR_EXECUTION.directPull.maximumTransportBackoffSeconds, 30);
 equal("direct pull runtime journal root", BANKR_EXECUTION.directPull.runtimeJournalRoot, "/stonk-gacha/pulls");
-equal("direct pull intent TTL", BANKR_EXECUTION.directPull.intentTtlSeconds, 600);
+equal("direct pull compact orchestrator", BANKR_EXECUTION.directPull.orchestrator, "scripts/pull.mjs");
+equal("direct pull compact state schema", BANKR_EXECUTION.directPull.stateSchemaVersion, 2);
+equal("direct pull compact output transaction cap", BANKR_EXECUTION.directPull.maximumUnsignedTransactionsPerOutput, 1);
+equal("direct pull records state before output", BANKR_EXECUTION.directPull.stateWrittenBeforeTransactionOutput, true);
+equal("direct pull compact home state directory", BANKR_EXECUTION.directPull.compactStateHomeDirectory, ".stonk-gacha/pulls");
+equal("direct pull stale lock lease", BANKR_EXECUTION.directPull.compactStateLockStaleSeconds, 300);
+equal("direct pull proven-revert retry cap", BANKR_EXECUTION.directPull.maximumAutomaticProvenRevertRetriesPerPhase, 1);
+equal("direct pull intent TTL", BANKR_EXECUTION.directPull.intentTtlSeconds, 7200);
 equal("direct claim continuation TTL", BANKR_EXECUTION.directPull.claimContinuationTtlSeconds, 172800);
 equal("direct claim continuation spans resolve plus delivery grace", BANKR_EXECUTION.directPull.claimContinuationTtlSeconds, DEPLOYMENT.productTerms.resolveWindowSeconds * 2);
 check("direct pull policy binds price, request baseline, source receipt, and hidden capability", BANKR_EXECUTION.directPull.requireExactAuthorizedPrice && BANKR_EXECUTION.directPull.requireUnchangedRequestCountBeforeOpen && BANKR_EXECUTION.directPull.claimSource === "exact-proven-PackOpened-receipt-only" && BANKR_EXECUTION.directPull.claimCapability.includes("secret-preimage"));
@@ -1430,7 +1460,7 @@ const frontmatter = skillMarkdown.match(/^---\n([\s\S]*?)\n---(?:\n|$)/)?.[1] ??
 equal("Bankr skill name", frontmatter.match(/^name:\s*(.+)$/m)?.[1]?.trim(), "stonk-gacha");
 check("Bankr skill description exists", /^description:\s*\S.+$/m.test(frontmatter));
 check("Bankr top-level tags exist", /^tags:\s*\[[^\]]+\]$/m.test(frontmatter));
-equal("Bankr top-level version", Number(frontmatter.match(/^version:\s*(\d+)$/m)?.[1]), 5);
+equal("Bankr top-level version", Number(frontmatter.match(/^version:\s*(\d+)$/m)?.[1]), 6);
 equal("Bankr top-level visibility", frontmatter.match(/^visibility:\s*(\S+)$/m)?.[1], "public");
 equal("catalog slug", catalog.slug, "stonk-gacha");
 equal("catalog schema", catalog.schemaVersion, 1);
@@ -1438,13 +1468,14 @@ equal("catalog repo path", catalog.install.repoPath, ".");
 check("catalog points at public source", catalog.install.command.includes("github.com/panikadak/stonk-gacha-bankr-skill"));
 const catalogDemoTweet = catalog.demo.code.split("\n")[0].replace(/^You:\s*/, "");
 check("catalog demonstrates one-tweet install-to-delivery Gacha pull", catalogDemoTweet.startsWith("@bankrbot install the skill at https://github.com/panikadak/stonk-gacha-bankr-skill") && catalogDemoTweet.toLowerCase().includes("pull me a $10") && [...catalogDemoTweet].length <= 280 && catalog.demo.code.includes("You pulled $20 of GOOGLc.") && !catalog.demo.code.toLowerCase().includes("purchase"));
-check("skill requires silent open-to-delivery lifecycle", skillMarkdown.includes("Keep the entire workflow silent until completion") && skillMarkdown.includes("await-claim-prize") && skillMarkdown.includes("exact claim receipt"));
+const normalizedSkillMarkdown = skillMarkdown.replace(/\s+/g, " ");
+check("skill requires silent compact open-to-delivery lifecycle", skillMarkdown.includes("node scripts/pull.mjs start") && normalizedSkillMarkdown.includes("Stay silent through approval, open, settlement, and claim") && normalizedSkillMarkdown.includes("exact claim receipt"));
 
 for (const relative of [
   "SKILL.md", "references/operations.md", "references/bankr-execution.md",
   "references/deployment.json", "references/signing-allowlist.json", "references/bankr-execution.json",
   "references/funding-policy.json", "references/funding-fixtures.json", "references/x-confirmation.md",
-  "scripts/lib/direct.mjs", "scripts/lib/watch.mjs",
+  "scripts/pull.mjs", "scripts/lib/direct.mjs", "scripts/lib/pull-state.mjs", "scripts/lib/watch.mjs",
 ]) {
   try {
     const bytes = statSync(new URL(`../${relative}`, import.meta.url)).size;

@@ -169,6 +169,7 @@ const COMMAND_FLAGS = Object.freeze({
   "plan-distribute-profit": ["wallet", "amount-usdc", "slippage-bps"],
   "inspect-calldata": ["wallet", "chain-id", "to", "data", "value", "context", "plan-key"],
   "inspect-tx": ["wallet", "tx", "context", "plan-key"],
+  "inspect-delivered-tx": ["wallet", "tx", "request-id"],
 });
 
 const args = {};
@@ -1495,27 +1496,37 @@ async function awaitClaimPrize() {
     timestamp: snapshot.timestamp,
     recipient: wallet,
     slippageBps: DIRECT_CLAIM_SLIPPAGE_BPS,
-  });
+  }, { allowExpired: true });
   gate(assessment.ok, "direct-claim-continuation", "direct claim continuation no longer authorizes this exact delivery", { issues: assessment.issues });
   await proveDirectClaimSource(continuation);
   gate(initialRequest.buyer === wallet, "buyer", "watched request buyer differs from the active wallet");
 
-  const outcome = await watchExactRequest({
-    wallet,
-    requestId,
-    continuationExpiresAt: continuation.expiresAt,
-    timeoutMs: Number(maxWaitSeconds * 1_000n),
-    pollIntervalMs: Number(pollIntervalSeconds * 1_000n),
-    maxConsecutiveTransportErrors: Number(BANKR_EXECUTION.directPull.maximumConsecutiveTransportErrors),
-    maxTransportBackoffMs: Number(BANKR_EXECUTION.directPull.maximumTransportBackoffSeconds) * 1_000,
-    isRetryableTransportError: isRetryableRpcTransportError,
-    readRequest: async (exactRequestId) => {
-      const exactSnapshot = await beginSnapshot();
-      const request = await readRequest(exactRequestId, exactSnapshot);
-      await confirmSnapshot(exactSnapshot);
-      return request;
-    },
-  });
+  const continuationExpired = snapshot.timestamp >= BigInt(continuation.expiresAt);
+  const terminalOutcome = {
+    Delivered: "delivered",
+    Expired: "expired",
+    Refunded: "refunded",
+  }[initialRequest.status];
+  const outcome = terminalOutcome
+    ? { outcome: terminalOutcome, status: initialRequest.status, request: initialRequest }
+    : continuationExpired
+      ? { outcome: "continuation-expired", status: initialRequest.status, request: initialRequest }
+      : await watchExactRequest({
+        wallet,
+        requestId,
+        continuationExpiresAt: continuation.expiresAt,
+        timeoutMs: Number(maxWaitSeconds * 1_000n),
+        pollIntervalMs: Number(pollIntervalSeconds * 1_000n),
+        maxConsecutiveTransportErrors: Number(BANKR_EXECUTION.directPull.maximumConsecutiveTransportErrors),
+        maxTransportBackoffMs: Number(BANKR_EXECUTION.directPull.maximumTransportBackoffSeconds) * 1_000,
+        isRetryableTransportError: isRetryableRpcTransportError,
+        readRequest: async (exactRequestId) => {
+          const exactSnapshot = await beginSnapshot();
+          const request = await readRequest(exactRequestId, exactSnapshot);
+          await confirmSnapshot(exactSnapshot);
+          return request;
+        },
+      });
 
   if (outcome.outcome === "ready") return await planClaimPrize();
   if (outcome.outcome === "delivered") {
@@ -2215,7 +2226,7 @@ function proveExactErc20Transfer(logs, token, from, to, amount, label) {
   return { token, from, to, amount };
 }
 
-async function proveBankrExecutionReceipt(envelope, transaction, receipt) {
+async function proveBankrExecutionReceipt(envelope, transaction, receipt, options = {}) {
   gate(receipt.blockNumber && receipt.blockHash, "receipt", "receipt has no mined block identity");
   gate(transaction.hash?.toLowerCase() === receipt.transactionHash?.toLowerCase(), "receipt", "transaction and receipt hashes do not match");
   const receiptBlock = await getBlockByHash(receipt.blockHash, true);
@@ -2263,7 +2274,14 @@ async function proveBankrExecutionReceipt(envelope, transaction, receipt) {
   }
   gate(entryPointCodeHash === ENTRY_POINT_V07_CODE_HASH, "receipt", "supported EntryPoint runtime identity changed");
   let userOperationEvent;
-  try { userOperationEvent = verifyBankrExecutionReceipt(envelope, receipt, expectedUserOpHash); }
+  try {
+    userOperationEvent = verifyBankrExecutionReceipt(
+      envelope,
+      receipt,
+      expectedUserOpHash,
+      { allowReverted: options.allowReverted === true },
+    );
+  }
   catch (error) { throw new GateError("receipt", error.message); }
   let parentRootValidator = ZERO_ROOT_VALIDATOR_RESULT;
   if (parentWalletCode === "0x") {
@@ -2638,7 +2656,6 @@ async function commandInspectTx() {
   const [transaction, receipt] = await Promise.all([getTransaction(hash), getReceipt(hash)]);
   gate(transaction && receipt, "pending", "transaction is pending or unavailable; do not retry an unknown outcome", { hash });
   gate(Number(BigInt(transaction.chainId)) === 8453, "chain", "transaction is not on Base chainId 8453");
-  gate(BigInt(receipt.status) === 1n, "receipt", "transaction mined with reverted status");
   let envelope;
   try { envelope = decodeBankrExecution(transaction, wallet); }
   catch (error) { throw new GateError("bankr-envelope", error.message); }
@@ -2649,7 +2666,7 @@ async function commandInspectTx() {
     value: envelope.logicalCall.value.toString(),
   };
   const inspection = await inspectLogicalCall({ wallet, tx, contextHex, expectedInspectionKey, verifyFreshState: false });
-  const executionProof = await proveBankrExecutionReceipt(envelope, transaction, receipt);
+  const executionProof = await proveBankrExecutionReceipt(envelope, transaction, receipt, { allowReverted: true });
   const receiptIdentity = executionProof.receiptBlockIdentity;
   const receiptSnapshot = {
     number: receiptIdentity.number,
@@ -2662,6 +2679,25 @@ async function commandInspectTx() {
   gate(deploymentIdentityProof.ok, "receipt-deployment", "the complete Stonk Gacha dependency graph did not match the reviewed release at the receipt block", {
     failed: deploymentIdentityProof.failed,
   });
+  const logicalSuccess = BigInt(receipt.status) === 1n
+    && (envelope.mode === "direct-wallet-transaction" || executionProof.userOperationEvent?.success === true);
+  if (!logicalSuccess) {
+    out({
+      ok: true,
+      command,
+      phase: "proven-reverted",
+      hash,
+      wallet,
+      executionMode: envelope.mode,
+      logicalCall: tx,
+      inspection,
+      executionProof,
+      deploymentIdentityProof,
+      postStateProof: null,
+      verdict: "the exact persisted Bankr logical call was mined and reverted; no action event or success post-state is accepted",
+    });
+    return;
+  }
   const range = executionProof.userOperationEvent?.receiptLogRange ?? null;
   const scopedLogs = range ? receipt.logs.slice(range.start, range.end) : receipt.logs;
   const events = actionLogs(scopedLogs);
@@ -2704,6 +2740,86 @@ async function commandInspectTx() {
   });
 }
 
+async function commandInspectDeliveredTx() {
+  const wallet = walletArg();
+  const hash = bytes32Arg("tx");
+  const requestId = requestIdArg();
+  const [transaction, receipt] = await Promise.all([getTransaction(hash), getReceipt(hash)]);
+  gate(transaction && receipt, "pending", "transaction is pending or unavailable; do not infer delivery", { hash });
+  gate(Number(BigInt(transaction.chainId)) === 8453, "chain", "transaction is not on Base chainId 8453");
+  gate(BigInt(receipt.status) === 1n, "receipt", "delivery transaction mined with reverted status");
+  let envelope;
+  try { envelope = decodeBankrExecution(transaction, wallet); }
+  catch (error) { throw new GateError("bankr-envelope", error.message); }
+  const tx = {
+    chainId: 8453,
+    to: envelope.logicalCall.target,
+    data: envelope.logicalCall.data.toLowerCase(),
+    value: envelope.logicalCall.value.toString(),
+  };
+  const action = knownActionBySelector(tx.to, txSelector(tx.data));
+  gate(action?.name === "claim-prize", "allowlist", "recovered delivery must be same-wallet claimPrize on the reviewed Gacha");
+  gate(BigInt(tx.value) === 0n, "value", "claimPrize must carry zero native value");
+  const values = decodeCallArguments(action.inputTypes, tx.data);
+  gate(values[0] === requestId && values[1] > 0n, "request", "recovered delivery request or minimum output is invalid");
+  const executionProof = await proveBankrExecutionReceipt(envelope, transaction, receipt);
+  const receiptIdentity = executionProof.receiptBlockIdentity;
+  const receiptSnapshot = {
+    number: receiptIdentity.number,
+    timestamp: receiptIdentity.timestamp,
+    hash: receiptIdentity.hash,
+    parentHash: receiptIdentity.parentHash,
+    ref: { blockHash: receiptIdentity.hash, requireCanonical: true },
+  };
+  const deploymentIdentityProof = await verifyDeployment(receiptSnapshot);
+  gate(deploymentIdentityProof.ok, "receipt-deployment", "the Stonk Gacha deployment did not match the reviewed release at the delivery block", {
+    failed: deploymentIdentityProof.failed,
+  });
+  const deliveredAtReceipt = await readRequest(requestId, receiptSnapshot);
+  gate(
+    deliveredAtReceipt.buyer === wallet && deliveredAtReceipt.status === "Delivered",
+    "post-state",
+    "receipt-block request state is not a Delivered pull owned by the active wallet",
+  );
+  const context = {
+    terms: {
+      token: deliveredAtReceipt.token,
+      payoutUsdc: deliveredAtReceipt.payoutUsdc,
+      routeHash: deliveredAtReceipt.routeHash,
+      minStockOut: values[1],
+    },
+  };
+  const range = executionProof.userOperationEvent?.receiptLogRange ?? null;
+  const scopedLogs = range ? receipt.logs.slice(range.start, range.end) : receipt.logs;
+  const events = actionLogs(scopedLogs);
+  const eventProof = proveActionEvents(action.name, events, scopedLogs, wallet, values, context);
+  const postStateProof = await postActionState(action.name, eventProof, context, {
+    transactionHash: hash,
+    receiptTimestamp: receiptIdentity.timestamp,
+  });
+  gate(String(postStateProof.requestId) === requestId.toString(), "post-state", "delivery receipt resolved a different request");
+  out({
+    ok: true,
+    command,
+    hash,
+    wallet,
+    executionMode: envelope.mode,
+    logicalCall: tx,
+    action: { name: action.name, selector: action.selector },
+    executionProof,
+    deploymentIdentityProof,
+    receiptLogScope: range,
+    eventProof,
+    postStateProof,
+    presentation: {
+      mode: "final-only",
+      finalMessage: postStateProof.finalMessage,
+      rule: "Reply with finalMessage verbatim and nothing else.",
+    },
+    verdict: "exact successful same-wallet claim receipt and Delivered request state proved",
+  });
+}
+
 function help() {
   out({
     ok: true,
@@ -2725,6 +2841,7 @@ function help() {
     inspection: [
       "inspect-calldata --wallet --chain-id 8453 --to --data --value --context --plan-key",
       "inspect-tx --wallet --tx --context --plan-key",
+      "inspect-delivered-tx --wallet --tx --request-id",
     ],
     xConfirmation: [
       "bind-x-funding-intent --wallet --intent --intent-key --x-user-id --confirmation-tweet-id --confirmation-channel x --confirmation-message-hex",
@@ -2761,6 +2878,7 @@ async function main() {
     case "plan-distribute-profit": return await planDistributeProfit();
     case "inspect-calldata": return await commandInspectCalldata();
     case "inspect-tx": return await commandInspectTx();
+    case "inspect-delivered-tx": return await commandInspectDeliveredTx();
     default: throw new GateError("args", `unknown command: ${command}`);
   }
 }

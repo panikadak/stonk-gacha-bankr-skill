@@ -1,153 +1,147 @@
-# Pull resume record
+# Compact pull state
 
-This is a small, private crash-recovery record for Bankr. The local CLI stays
-stateless and never signs or broadcasts.
+The compact pull CLI owns a private crash-recovery record. It writes the next
+phase atomically before returning a transaction. Bankr still signs and
+broadcasts; local state cannot create transaction authority.
 
-## Authority and storage
+## Location and authority
 
-- Onchain request state is truth.
-- The exact unexpired receipt-bound continuation is silent claim authority.
-- The journal is only a private resume hint; editing it cannot create or widen
-  authority.
+Records live at:
 
-The pre-open intent lasts at most 600 seconds. After `inspect-tx` proves
-`PackOpened`, same-wallet claim authority lasts at most 172800 seconds. Every
-claim plan still uses a fresh quote and a deadline no more than 600 seconds from
-its pinned snapshot. Journal state cannot renew either authorization.
+~~~text
+~/.stonk-gacha/pulls/8453/<lowercase-wallet>/<directIntentKey-without-0x>.json
+~~~
 
-Store one record per request at exactly:
+STONK_GACHA_PULLS_ROOT may replace only the root for tests. The production
+location is fixed by references/bankr-execution.json.
 
-```text
-/stonk-gacha/pulls/8453/<lowercase-wallet>/<requestId>.json
-```
+Each record is mode 0600 inside a mode 0700 wallet directory. Writes use a
+same-directory temporary file, file fsync, atomic rename, and directory fsync.
+The reader rejects symlinks, noncanonical paths or JSON, loose permissions,
+unknown fields, wrong wallet, wrong chain or deployment, and stale concurrent
+revisions.
 
-Never store it under `/.memory`, `/cli`, `/skills`, `/runs`, the installed skill
-directory, a repository, or a shared aggregate file. Never expose a
-continuation, inspection context, credential, or calldata in chat, public/user-
-visible logs, issues, or Git; protected CLI output is the runtime handoff.
-Reject a mismatched chain, wallet, request, schema, path, symlink, redirect,
-duplicate, or unknown field.
+The pull id equals the direct intent key. The record revalidates the complete
+direct intent and, after open, the complete receipt-bound claim continuation.
+Its wallet, authorization, creation time, request id, open hash, continuation,
+key, and expiry are immutable. Editing the file cannot widen or renew either
+authorization.
 
-Immediately after the open receipt is proven, persist the exact record emitted
-by `inspect-tx`:
+Onchain state and exact successful receipts remain truth. This file is only a
+private resume and replay-prevention aid. Bankr submission and a local file
+write are not one atomic operation, so this design does not claim platform
+exactly-once delivery.
 
-```json
-{
-  "schemaVersion": 1,
-  "chainId": 8453,
-  "gacha": "0x...",
-  "wallet": "0xlowercase",
-  "requestId": "123",
-  "openTransactionHash": "0x...",
-  "claimContinuation": "0x...",
-  "claimContinuationKey": "0x...",
-  "claimContinuationExpiresAt": "unix-seconds",
-  "stage": "awaiting-settlement",
-  "claimInspectionContextHex": null,
-  "claimInspectionKey": null,
-  "claimTransactionHash": null
-}
-```
+## State machine
 
-Write the exact CLI object without adding or decoding fields. Before claim
-submission, the planner fills `claimInspectionContextHex` and
-`claimInspectionKey`; retain those opaque values only so a recovered transaction
-hash can be passed to `inspect-tx`. They are receipt-proof material, not resend
-authority. Do not separately persist or reconstruct a quote, `minOut`, deadline,
-token price, randomness, or pending claim calldata; generate them only from a
-fresh `Ready` read.
+Normal stages are:
 
-For X, keep the authenticated original-tweet/thread mapping and final-reply
-dedupe marker in the runtime's existing protected conversation state, not in
-this JSON record. Routing data never authorizes a transaction and must not come
-from tweet text. If trusted reply routing is unavailable after a restart, never
-guess another thread.
+~~~text
+allowance-reset-submitting
+  -> approval-submitting
+  -> open-submitting
+  -> awaiting-settlement
+  -> claim-submitting
+  -> delivered
+~~~
 
-The normal stages are `awaiting-settlement`, `ready`, `claim-submitting`,
-`claim-submitted`, `needs-reconciliation`, `delivered`, `expired`, `refunded`,
-and `stopped`. Keep one writer per request. Before a claim submission, accept
-only `awaiting-settlement` or `ready` as the prior stage; if another execution
-changed it, reconcile onchain state before doing anything.
+The allowance reset can move directly to open if fresh state already has the
+exact allowance. Any pre-open stage may skip unnecessary allowance work, but
+open is never prepared alongside approval. An exact proven pre-open revert is
+first persisted as preopen-reverted, then either enters one fresh planner phase
+or stops safely if replanning fails. Other terminal or stop states are expired,
+refunded, stopped, and needs-reconciliation.
 
-## Reconcile first
+A submitting stage means its one transaction was marked consumed before being
+returned to Bankr. It is not permission to rerun start or obtain another copy.
+The exact returned hash must be passed to the emitted advance or finish command.
 
-At every Stonk Gacha skill invocation, resolve the authenticated active wallet
-and reconcile all its nonterminal records before planning another write:
+Every update uses compare-and-swap revision checks and a fixed transition
+allowlist. Wallet-scoped start discovery captures a generation of every compact
+record; final creation runs under a second exclusive lease and rejects the
+prepared plan if that generation changed, including when a competing pull
+already reached a terminal state. Record-scoped leases prevent phase updates
+from silently overwriting each other. Lock files
+are fully written before atomic hard-link acquisition, stale recovery is bound
+to one observed inode under a separately recoverable reaper lease, and release
+removes only the holder's own inode. A valid dead-owner lock older than five
+minutes is recoverable; a live owner or malformed lock remains fail-closed. An
+interrupted write leaves the prior canonical file intact.
 
-1. Validate the record and continuation.
-2. Re-prove the source `PackOpened` receipt and exact request binding.
-3. Read the request from one fresh canonical Base snapshot.
-4. Reconcile any known claim hash with its receipt and Bankr Activity.
+## Recovery
 
-Process multiple records independently; never select by recency, amount, or
-symbol. Reconciliation stays silent and must not block an unrelated read.
+At start, pull.mjs checks every nonterminal record for the active wallet before
+planning a new write:
 
-| Fresh state | Action |
-|---|---|
-| `Pending`, authority valid | Keep `awaiting-settlement` and resume only its exact watcher. |
-| `Ready`, authority valid | Move to `ready` and build one fresh claim plan. |
-| `Ready`, authority missing, invalid, stopped, or expired | No silent write; require normal standalone-claim confirmation. |
-| `Delivered` | Never resubmit; recover and inspect the exact claim receipt before reporting it. Request state alone does not prove the recipient. |
-| `Expired` or `Refunded` | Stop silent delivery; refund work needs its normal decision. |
-| Unknown submission outcome | Move to `needs-reconciliation`; reconcile and never replay. |
+- awaiting-settlement resumes only its exact receipt-bound request watcher;
+- an approval stage without a hash may advance only if a fresh allowance read
+  unambiguously proves the previous post-state;
+- open-submitting or claim-submitting without its exact hash never emits a
+  replacement transaction;
+- Delivered request state without the exact claim receipt never produces a
+  result;
+- expired or refunded requests never produce a prize claim;
+- multiple unfinished compact pulls require exact reconciliation rather than a
+  recency guess.
 
-## Await the exact request
+The direct pre-open authorization remains valid for two hours so an approval
+confirmed near a Bankr turn limit can still resume through a fresh allowance,
+request-count, offer, price, ceiling, fee, balance, and simulation gate. The
+stored authorization never bypasses those live checks.
 
-```bash
-node scripts/stonk-gacha.mjs await-claim-prize \
-  --wallet 0xActiveBankrEvmWallet \
-  --request-id REQUEST_ID \
-  --claim-continuation 0xEXACT_RECEIPT_BOUND_CONTINUATION \
-  --claim-continuation-key 0xEXACT_CONTINUATION_KEY \
-  --max-wait-seconds BOUNDED_WAIT \
-  --poll-interval-seconds BOUNDED_INTERVAL
-```
+Recover a lost hash from Bankr Activity. Use the record's emitted command:
 
-The command re-proves the source receipt, wallet, request, continuation,
-deployment, and each fresh observation. It never signs or broadcasts.
-`Pending` at timeout emits no transaction and leaves the record resumable.
-`Ready` emits at most one fresh default same-wallet claim plan. `Delivered`
-emits no transaction and requires exact claim-receipt reconciliation before a
-result; `Expired` and `Refunded` emit no claim transaction.
+~~~bash
+node scripts/pull.mjs advance --wallet 0xActiveWallet --pull-id PULL_ID --tx 0xExactHash
+node scripts/pull.mjs finish  --wallet 0xActiveWallet --pull-id PULL_ID --tx 0xExactClaimHash
+~~~
 
-Keep each watcher comfortably below Bankr's
-[60-minute job maximum](https://docs.bankr.bot/faq/building-ai-agents/). A
-process timeout is not an authorization timeout. Preserve the record and resume
-it in the same process when possible or at the next skill invocation; do not
-post progress.
+Receipt inspection proves the Bankr execution envelope, exact inner logical
+call, deployment identity at the receipt block, scoped events, and fresh
+post-state. A pending, unavailable, wrong, or otherwise unproved hash does not
+authorize a retry. Only the exact persisted logical call, bound inspection
+context, Bankr envelope, mined receipt, and receipt-block deployment together
+may prove a revert. That proof can return the same unexpired direct intent to a
+fresh pre-open planner, or a failed claim to the same request watcher. It never
+reuses the reverted calldata. Each phase permits at most one such automatic
+retry; a second proven revert emits no transaction.
 
-## Claim submission
+If the request is already Delivered after a process restart, finish can recover
+from the exact successful same-wallet claim hash without the prior in-memory
+claim plan. It decodes only claimPrize for the stored request, proves the Bankr
+envelope, receipt-block deployment, scoped delivery events, token movement, and
+fresh Delivered state before producing the result. Request state without that
+hash remains insufficient.
 
-Before Bankr submission, change `awaiting-settlement` or `ready` to
-`claim-submitting` and retain the exact opaque claim inspection context/key. If
-the stage changed unexpectedly, do not submit. Submit the unchanged inspected
-planner transaction once. Record a returned hash in `claimTransactionHash` and
-change to `claim-submitted` before receipt polling.
+Continuation expiry removes automatic claim authority but does not hide
+onchain terminal state. The watcher still recognizes Delivered, Expired, or
+Refunded and updates the compact record accordingly. A nonterminal Pending or
+Ready request instead asks for a fresh user decision and emits no transaction.
 
-- Successful receipt plus fresh `Delivered` state becomes `delivered`.
-- A proven revert may return to `ready` for a fresh plan while the same
-  continuation remains valid.
-- A timeout, connection loss, missing hash, pending receipt, or other uncertain
-  result becomes `needs-reconciliation`. Reconcile the request, receipt, nonce
-  or UserOperation, and Bankr Activity. Never submit a second claim while the
-  first outcome is unknown.
+## Settlement
 
-Raw `/wallet/submit` has no documented idempotency key. These checks reduce
-duplicate risk but do not promise platform-level exactly-once execution.
+After the proven open receipt, advance stores its exact request id, open
+transaction hash, and receipt-derived claim continuation before polling.
+Pending timeouts emit no transaction and retain awaiting-settlement. Ready
+produces one fresh same-wallet claim with a nonzero 97% quote floor and records
+claim-submitting before returning it.
 
-## Stop monitoring
-
-For `stop monitoring pull N`, resolve the active wallet and exact record, stop
-its active watcher, set only that record's stage to `stopped`, and clear its
-continuation, key, and expiry without adding fields. Make no onchain
-transaction. The request remains manually claimable under a new current user
-decision.
+The compact wrapper uses one bounded watcher call of up to 3300 seconds by
+default, below Bankr's 60-minute job ceiling. A process timeout does not expire
+onchain state or renew authority; a later compact invocation resumes the same
+request.
 
 ## User-facing boundary
 
-Journal writes, polls, resumes, and claim preparation stay internal. Only after
-`inspect-tx` proves delivery and a fresh request read is `Delivered`, reply:
+Records, phases, polls, calldata, continuations, hashes, and recovery stay
+private. Only finish can produce a successful final-only presentation, after
+the exact claim receipt and fresh Delivered state agree:
 
-```text
+~~~text
 You pulled $X of SYMBOL.
-```
+~~~
+
+If the finish process loses its output after recording Delivered, rerunning the
+same emitted finish command with the same pull id and claim hash re-proves the
+receipt and returns the same final-only sentence. It cannot accept a different
+hash or create another pull.
